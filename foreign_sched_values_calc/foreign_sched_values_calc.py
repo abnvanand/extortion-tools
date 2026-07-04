@@ -2224,7 +2224,7 @@ class ShareLot(MapToEntity, DatewiseLog):
         return self.sellings.total_ltcg_amount_inr_for_tax_between_dates(
             fy_start(),
             fy_end(),
-            lambda txn: txn.is_gain and date_in_installment(txn.date)
+            lambda txn: date_in_installment(txn.date)
         )
 
     def total_stcg_amount_inr_for_advance_tax_installment(
@@ -2237,7 +2237,7 @@ class ShareLot(MapToEntity, DatewiseLog):
         return self.sellings.total_stcg_amount_inr_for_tax_between_dates(
             fy_start(),
             fy_end(),
-            lambda txn: txn.is_gain and date_in_installment(txn.date)
+            lambda txn: date_in_installment(txn.date)
         )
 
     def total_dividend_amount_inr_for_advance_tax_installment(
