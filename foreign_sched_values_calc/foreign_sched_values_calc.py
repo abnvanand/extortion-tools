@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Hashable
 from copy import deepcopy
 import csv
 from dataclasses import dataclass, field as dataclass_field
-from datetime import date as Date, timedelta
+from datetime import date as Date, datetime, timedelta
 from fractions import Fraction
 from inspect import cleandoc
 import json
@@ -47,11 +47,11 @@ import yahooquery as yq
 ##############################################################################
 
 
-file_dir = Path(__file__).parent / "data"
-file_dir.mkdir(exist_ok=True)
+HERE = Path(__file__).parent
+file_dir = HERE / "data"
 
-output_dir = file_dir / "output"
-output_dir.mkdir(exist_ok=True)
+current_commit_id_str = None
+output_dir = None
 
 input_yaml_path = file_dir / "input.yaml"
 input_dict = None
@@ -60,6 +60,24 @@ metadata_dict = {}
 fx_rate_repo_dir = file_dir / "sbi-fx-ratekeeper"
 fx_rate_repo_link = "https://github.com/sahilgupta/sbi-fx-ratekeeper.git"
 ttbr_dict = {}
+
+
+def init_global_vars() -> None:
+    global current_commit_id_str, output_dir
+
+    current_commit_id_str = subprocess.check_output(
+        ["git", "rev-parse", "--short", "HEAD"], text=True
+    ).strip()
+
+    file_dir.mkdir(exist_ok=True)
+
+    if not input_yaml_path.exists():
+        raise ValueError("input.yaml doesn't exist in the data/ directory.")
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    output_dir = file_dir / "output" / f"{timestamp}_{current_commit_id_str}"
+
+    output_dir.mkdir(parents=True)
 
 
 ##############################################################################
@@ -3932,6 +3950,21 @@ def parse_main_activities() -> None:
 ###############################################################################
 
 
+def create_input_copy() -> None:
+    """
+    Save the input in output dir with commit ID in name so that the user can
+    exactly reproduce and trace what happened.
+    """
+    og_path = input_yaml_path
+    copy_path = output_dir / "input_used_for_this_output.yaml"
+
+    # Do the copy. Can't use Path.copy() as it got added since Python 3.14.
+    copy_path.write_bytes(og_path.read_bytes())
+
+    rel_path = copy_path.relative_to(HERE)
+    print(f"Input YAML copied to stay with output in {rel_path}")
+
+
 def create_prefilled_yaml_for_next_year() -> None:
     """
     Since we have information already for this year, we can prefill this year's
@@ -4122,7 +4155,7 @@ def create_prefilled_yaml_for_next_year() -> None:
             f.write(line)
             f.write("\n")
 
-    rel_path = yaml_path.relative_to(Path(__file__).parent)
+    rel_path = yaml_path.relative_to(HERE)
     print(f"Pre-filled input file for next year stored in {rel_path}")
 
 
@@ -4263,7 +4296,7 @@ def create_schedule_fa_table_a2() -> None:
     csv_path = output_dir / "schedule_fa_table_a2.csv"
     save_csv_rows(csv_rows, csv_path)
 
-    rel_path = csv_path.relative_to(Path(__file__).parent)
+    rel_path = csv_path.relative_to(HERE)
     print(f"Schedule FA Table A2 stored in {rel_path}")
 
 
@@ -4311,7 +4344,7 @@ def create_schedule_fa_table_a3() -> None:
     csv_path = output_dir / "schedule_fa_table_a3.csv"
     save_csv_rows(csv_rows, csv_path)
 
-    rel_path = csv_path.relative_to(Path(__file__).parent)
+    rel_path = csv_path.relative_to(HERE)
     print(f"Schedule FA Table A3 stored in {rel_path}")
 
 
@@ -4390,7 +4423,7 @@ def create_capital_gain_and_dividends_and_get_average_tax_rate() -> Fraction:
     with open(txt_path, "w") as f:
         json.dump(cg_dict_for_export, f, indent="\t")
 
-    rel_path = txt_path.relative_to(Path(__file__).parent)
+    rel_path = txt_path.relative_to(HERE)
 
     print("\n")
     print(cleandoc(f"""
@@ -4645,14 +4678,14 @@ def create_schedule_fsi_and_form_67(avg_tax_rate: Fraction) -> None:
     fsi_csv_path = output_dir / "schedule_fsi.csv"
     save_csv_rows(fsi_csv_rows, fsi_csv_path)
 
-    fsi_rel_path = fsi_csv_path.relative_to(Path(__file__).parent)
+    fsi_rel_path = fsi_csv_path.relative_to(HERE)
     print("Schedule FSI partially filled for reference stored in "
           f"{fsi_rel_path}")
 
     form67_csv_path = output_dir / "form_67.csv"
     save_csv_rows(form67_csv_rows, form67_csv_path)
 
-    form67_rel_path = form67_csv_path.relative_to(Path(__file__).parent)
+    form67_rel_path = form67_csv_path.relative_to(HERE)
     print()
     print(cleandoc(f"""
         Form 67 stored in {form67_rel_path}
@@ -4676,7 +4709,20 @@ def parse_input() -> None:
     parse_main_activities()
 
 
+def ensure_clean_working_tree() -> None:
+    """
+    We want a clean working tree, since we want a commit ID when saving output
+    so that user can exactly know what ran on the input.
+    """
+    if subprocess.check_output(["git", "status", "--porcelain"]):
+        raise ValueError(
+            "The working tree is dirty. Commit or remove any changes."
+        )
+
+
 def main() -> int:
+    ensure_clean_working_tree()
+
     # Modifications to this is also an agreement to the license, which applies
     # to the source code.
     print(cleandoc("""
@@ -4722,12 +4768,15 @@ def main() -> int:
         return 1
 
     print("\n")
+
+    init_global_vars()
     fetch_input()
     fetch_fx_rates()
     parse_input()
 
     print("\n" + "-" * 79 + "\n")
 
+    create_input_copy()
     create_prefilled_yaml_for_next_year()
     print()
 
