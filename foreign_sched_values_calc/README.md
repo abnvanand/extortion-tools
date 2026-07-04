@@ -31,6 +31,9 @@ that is, create a folder named `data` here and put `input.yaml` inside it.
 
 Read `input_example.yaml` to know how to make your own `input.yaml`.
 
+The script will generate a prefilled input YAML for the next year so you don't
+have to repeat the process / scratch your heads, and focus only on the next FY.
+
 ---
 
 ## Requirements
