@@ -4652,7 +4652,9 @@ def create_schedule_fsi_and_form_67(avg_tax_rate: Fraction) -> None:
             return getattr(country, f"{attr}_{income_type_key}")
 
         dtaa_tax_rate_pc = country_attr("dtaa_tax_rate_percent")
-        withholding_tax_rate_pc = country_attr("tax_withholding_rate_percent")
+        withholding_tax_rate_pc = country_attr(
+            "tax_withholding_rate_percent_for"
+        )
 
         int_tax_in_india = round_rs(income_value * avg_tax_rate)
         int_tax_dtaa = round_rs(income_value * dtaa_tax_rate_pc / 100)
