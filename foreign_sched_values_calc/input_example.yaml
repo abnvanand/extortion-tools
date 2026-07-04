@@ -411,11 +411,21 @@ activity_from_jan_1_prev_fy_to_31_mar_prev_fy:
         date: 2024-02-28
         entity: STOCK
         units: 20
-        stock_price_in_broker_doc: 147.36  # Sell will always have shown price.
-        tax_withholding:  # Must specify withholding, even if 0. See "Note 9".
+
+        # Sell will always have shown price.
+        stock_price_in_broker_doc: 147.36
+
+        # Gross proceeds shown by the broker, before fees and withholding.
+        # Must not differ from (units * stock_price_in_broker_doc) by >= 0.01.
+        sale_proceeds_in_broker_doc: 2947.20
+
+        # Must specify withholding, even if 0. See "Note 9".
+        tax_withholding:
             rate_percent: 0
             amount: 0
-        misc_fees: 0  # Must specify any other fees charged, even if 0.
+
+        # Must specify any other fees charged, even if 0.
+        misc_fees: 0
 
 
 ###############################################################################
@@ -448,6 +458,7 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
         unit_lot_key: STOCK_vest_new
         units: 5
         stock_price_in_broker_doc: 181.12
+        sale_proceeds_in_broker_doc: 905.60
         tax_withholding:
             rate_percent: 0
             amount: 0
@@ -526,6 +537,7 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
         entity: RANDOM
         units: 10
         stock_price_in_broker_doc: 22.88
+        sale_proceeds_in_broker_doc: 228.80
         # Specify the specific lot from which shares are sold.
         # In our example, earliest units are from RANDOM_prev_buy, and then
         # from RANDOM_buy_1. In FIFO selling, units from former would be sold.
@@ -543,7 +555,7 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
         broker: fidelity_rsu
         date: 2025-03-01
         new_entity: FYIXX
-        misc_fees: 0.01  # See the "Note -1" at the end below.
+        misc_fees: 0  # See the "Note -1" at the end below.
 
     - CASH_dividend_fidelity_2:  # Dividend from FYIXX, stored in FYIXX.
         activity_type: cash_dividend
@@ -572,8 +584,9 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
 # So the 0.17 tax is offsetted and tax should be 0.
 #
 # The -$0.01 seems to happen everytime the FDRXX fund was touched (it happened
-# when moving to FYIXX too), and it does not show up on 1042-S by the US IRS.
-# So it's not worth the hassle for measly tax credits.
+# when moving to FYIXX too), and it does not show up on 1042-S by the US IRS,
+# and neither in the transactions history CSV from Fidelity. Maybe it's error
+# from Fidelity? Anyways, it's not worth the hassle for measly tax credits.
 
 
 ###############################################################################

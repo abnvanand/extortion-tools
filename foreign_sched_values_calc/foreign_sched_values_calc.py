@@ -1160,9 +1160,14 @@ class VestingTransaction(_BuyTransaction):
 @dataclass(kw_only=True)
 class SellTransaction(_ShareTransaction, _TaxWithholdingAndFees):
     buy_txn_id: str
+    sale_proceeds_in_broker_doc: Fraction
 
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        if self.sale_proceeds_in_broker_doc <= 0:
+            raise ValueError("sale_proceeds_in_broker_doc <= 0 for "
+                             f"transaction '{self.txn_id}'.")
 
         try:
             buy_txn = all_share_transactions[self.buy_txn_id]
@@ -1186,6 +1191,10 @@ class SellTransaction(_ShareTransaction, _TaxWithholdingAndFees):
         return all_share_transactions[self.buy_txn_id]
 
     @property
+    def gross_total_value_native(self) -> Fraction:
+        return self.sale_proceeds_in_broker_doc
+
+    @property
     def net_total_value_native(self) -> Fraction:
         return self.gross_total_value_native - self.total_deduction_native
 
@@ -1197,8 +1206,8 @@ class SellTransaction(_ShareTransaction, _TaxWithholdingAndFees):
 
     @property
     def gain_amount_native(self) -> Fraction:
-        gain_per_unit = self.cost_per_unit - self.buy_txn_obj.cost_per_unit
-        return self.units * gain_per_unit
+        buy_value = self.units * self.buy_txn_obj.cost_per_unit
+        return self.gross_total_value_native - buy_value
 
     @property
     def gain_amount_inr_for_tax(self) -> Fraction:
@@ -2331,8 +2340,12 @@ class CashWallet(MapToEntity, DatewiseLog):
         self._ensure_not_closed()
 
         if amount > self.balance:
-            raise ValueError("Debiting amount > balance in the cash wallet "
-                             f"(entity {self.entity_id}).")
+            amt_str = f"{amount} = {float(amount)}"
+            bal_str = f"{self.balance} = {float(self.balance)}"
+            raise ValueError(
+                f"Debiting amount ({amt_str}) > balance ({bal_str}) "
+                f"present in the cash wallet (entity {self.entity_id})."
+            )
 
         txn = CashDebitTransaction(
             txn_id=txn_id,
@@ -2712,6 +2725,26 @@ class Broker(MapToCountry, DatewiseLog):
 
         return total_units
 
+    @staticmethod
+    def _validate_sale_proceeds_in_broker_doc(
+        *,
+        txn_id: str,
+        units: Fraction,
+        cost_per_unit: Fraction,
+        sale_proceeds_in_broker_doc: Fraction,
+    ) -> None:
+        calculated_proceeds = units * cost_per_unit
+        difference = abs(
+            sale_proceeds_in_broker_doc - calculated_proceeds
+        )
+
+        if difference >= Fraction("0.01"):
+            raise ValueError(
+                f"Broker sale proceeds for {txn_id} differ from units * "
+                "stock_price_in_broker_doc by >= 0.01 "
+                f"({sale_proceeds_in_broker_doc} vs {calculated_proceeds})."
+            )
+
     def sell_shares_fifo(
         self,
         *,
@@ -2720,6 +2753,7 @@ class Broker(MapToCountry, DatewiseLog):
         entity_id: str,
         units: Fraction,
         cost_per_unit: Fraction,
+        sale_proceeds_in_broker_doc: Fraction,
         misc_fees: Fraction,
         tax_withholding_dict: dict[str, Fraction]
     ) -> None:
@@ -2729,15 +2763,24 @@ class Broker(MapToCountry, DatewiseLog):
             raise ValueError(f"{txn_id} attempts to sell units <= 0 for "
                              f"entity {entity_id}.")
 
+        self._validate_sale_proceeds_in_broker_doc(
+            txn_id=txn_id,
+            units=units,
+            cost_per_unit=cost_per_unit,
+            sale_proceeds_in_broker_doc=sale_proceeds_in_broker_doc,
+        )
+
         existing_units = self._total_units_in_all_lots(entity_id)
         if existing_units < units:
             raise ValueError(f"{txn_id} attempts to sell units more than the "
                              f"existing units for entity {entity_id} across "
                              "all lots.")
 
-        overall_total_amount = units * cost_per_unit
-        overall_net_amount = \
-            overall_total_amount - tax_withholding_dict["amount"] - misc_fees
+        overall_net_amount = (
+            sale_proceeds_in_broker_doc
+            - tax_withholding_dict["amount"]
+            - misc_fees
+        )
 
         tax_withheld_rate = tax_withholding_dict["rate_percent"] / 100
 
@@ -2787,11 +2830,18 @@ class Broker(MapToCountry, DatewiseLog):
             # calculated automatically.
             gain_attr = "gain_amount_native"
 
+            # We have the total sale proceeds, but we are creating separate
+            # transaction for each lot. So let's divide proportionately.
+            sale_proceeds_for_lot = (
+                sale_proceeds_in_broker_doc * (units_to_sell / units)
+            )
+
             sell_txn = SellTransaction(
                 **sell_txn_common_args,
                 txn_id=lot_sell_txn_id,
                 units=units_to_sell,
                 buy_txn_id=lot.buy_txn_id,
+                sale_proceeds_in_broker_doc=sale_proceeds_for_lot,
                 misc_fees=misc_fees_per_lot,
                 tax_withholding_amount_native=0,
                 calculate_tax_withholding_amount_from_attribute=gain_attr,
@@ -2837,6 +2887,7 @@ class Broker(MapToCountry, DatewiseLog):
         entity_id: str,
         units: Fraction,
         cost_per_unit: Fraction,
+        sale_proceeds_in_broker_doc: Fraction,
         misc_fees: Fraction,
         tax_withholding_dict: dict[str, Fraction],
         india_tax_deducted_on_sell_to_cover: Fraction,
@@ -2846,6 +2897,13 @@ class Broker(MapToCountry, DatewiseLog):
         if units <= 0:
             raise ValueError(f"{txn_id} attempts to sell units <= 0 for "
                              f"entity {entity_id}.")
+
+        self._validate_sale_proceeds_in_broker_doc(
+            txn_id=txn_id,
+            units=units,
+            cost_per_unit=cost_per_unit,
+            sale_proceeds_in_broker_doc=sale_proceeds_in_broker_doc,
+        )
 
         if buy_txn_id not in self._lots[entity_id]:
             raise ValueError(f"{txn_id} attempts to sell units for an unknown "
@@ -2872,6 +2930,7 @@ class Broker(MapToCountry, DatewiseLog):
             units=units,
             cost_per_unit=cost_per_unit,
             buy_txn_id=lot.buy_txn_id,
+            sale_proceeds_in_broker_doc=sale_proceeds_in_broker_doc,
             misc_fees=misc_fees,
             tax_withholding_rate=(tax_withholding_dict["rate_percent"] / 100),
             tax_withholding_amount_native=tax_withholding_dict["amount"],
@@ -3874,6 +3933,9 @@ def _parse_main_activities(
                     entity_id=entity.entity_id,
                     units=activity_dict["units"],
                     cost_per_unit=activity_dict["stock_price_in_broker_doc"],
+                    sale_proceeds_in_broker_doc=(
+                        activity_dict["sale_proceeds_in_broker_doc"]
+                    ),
                     misc_fees=activity_dict["misc_fees"],
                     tax_withholding_dict=activity_dict["tax_withholding"],
                 )
@@ -3890,6 +3952,9 @@ def _parse_main_activities(
                     entity_id=entity.entity_id,
                     units=activity_dict["units"],
                     cost_per_unit=activity_dict["stock_price_in_broker_doc"],
+                    sale_proceeds_in_broker_doc=(
+                        activity_dict["sale_proceeds_in_broker_doc"]
+                    ),
                     misc_fees=activity_dict["misc_fees"],
                     tax_withholding_dict=activity_dict["tax_withholding"],
                     india_tax_deducted_on_sell_to_cover=stc_deduct,
