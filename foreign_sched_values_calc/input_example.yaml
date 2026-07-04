@@ -108,6 +108,10 @@ countries:
         dtaa_tax_rate_percent_ltcg: 0  # Different rates for LTCG and STCG.
         dtaa_tax_rate_percent_stcg: 0
 
+        # Add your TIN (taxpayer identification number) allotted in this
+        # country, otherwise add your passport number. Value must be quoted.
+        tin_or_passport: "A1234567"
+
 
 
     luteraa:  # See "Note 1".
@@ -124,6 +128,7 @@ countries:
         dtaa_tax_rate_percent_dividend: 10
         dtaa_tax_rate_percent_ltcg: 15
         dtaa_tax_rate_percent_stcg: 20
+        tin_or_passport: "XYZABCDEFG"
 
     China:
         name: China
@@ -139,6 +144,7 @@ countries:
         dtaa_tax_rate_percent_dividend: 10
         dtaa_tax_rate_percent_ltcg: 11
         dtaa_tax_rate_percent_stcg: 12
+        tin_or_passport: "A1234567"
 
     # and so on...
 

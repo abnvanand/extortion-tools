@@ -384,6 +384,7 @@ class Country(_BasePostInit):
     dtaa_tax_rate_percent_dividend: Fraction
     dtaa_tax_rate_percent_ltcg: Fraction
     dtaa_tax_rate_percent_stcg: Fraction
+    tin_or_passport: str
 
     # Last day of month -> (TTBR date, TTBR) mapping.
     _prev_month_last_ttbr_cache: dict[Date, tuple[Date, Fraction]] = \
@@ -418,6 +419,10 @@ class Country(_BasePostInit):
         if not (article := self.dtaa_article_stcg).isdigit():
             raise ValueError(f"Invalid non-number STCG article {article} for "
                              "country {self.country_id} DTAA.")
+
+        if not self.tin_or_passport:
+            raise ValueError("Empty tin_or_passport provided for "
+                             f"country {self.country_id}.")
 
         countries[self.country_id] = self
 
@@ -4618,6 +4623,8 @@ def create_schedule_fsi_and_form_67(avg_tax_rate: Fraction) -> None:
         fsi_csv_rows.append({
             "Country code": country.code,
             "Country name": country.name,
+
+            "Taxpayer Identification Number": country.tin_or_passport,
 
             "Income type": income_type,
             "Income value": round_rs(income_value),
