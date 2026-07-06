@@ -475,13 +475,19 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
     - STOCK_dividend_1_fidelity:
         activity_type: stock_dividend
         broker: fidelity_rsu
-        date: 2024-06-15
+        date: 2024-06-15  # PAYMENT date: when cash is credited
         entity: STOCK
-        amount: 12.24
+        amount: 12.24  # Broker's aggregate dividend for the whole holding.
         tax_withholding:  # Must specify tax withholding. See "Note 9".
             rate_percent: 25
             amount: 3.06
         misc_fees: 0  # Must specify any other fees charged, even if 0.
+        # OPTIONAL. The ex-dividend (record) date that fixes eligibility. If a
+        # lot was sold between this date and the payment `date`, it still earns
+        # the dividend; lots bought on/after this date earn nothing. Omit it and
+        # eligibility falls back to units still held on the payment date, which
+        # is wrong whenever shares are acquired or sold in that window.
+        ex_date: 2024-05-31
 
     - CASH_dividend_fidelity_1:  # Dividend from FDRXX, stored in FDRXX.
         activity_type: cash_dividend
