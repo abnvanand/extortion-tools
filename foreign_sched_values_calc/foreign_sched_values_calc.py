@@ -1296,6 +1296,44 @@ class SellTransaction(_ShareTransaction, _TaxWithholdingAndFees):
             return self.country.tax_withholding_rate_percent_for_stcg / 100
 
 
+@dataclass(kw_only=True)
+class GiftTransaction(_Transaction):
+    units: Fraction
+    buy_txn_id: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        if self.units <= 0:
+            raise ValueError("units <= 0 for gift transaction "
+                             f"'{self.txn_id}'.")
+
+        try:
+            buy_txn = all_share_transactions[self.buy_txn_id]
+        except KeyError:
+            raise ValueError(f"Invalid buy transaction '{self.buy_txn_id}'.")
+
+        if not isinstance(buy_txn, _BuyTransaction):
+            raise ValueError(f"Specified buy txn ID '{self.buy_txn_id}' is "
+                             f"not a buy txn (gift txn ID {self.txn_id}).")
+
+        if buy_txn.date > self.date:
+            raise ValueError("buy_date > gift_date for transaction "
+                             f"'{self.txn_id}'.")
+
+    @property
+    def buy_txn_obj(self) -> _BuyTransaction:
+        return all_share_transactions[self.buy_txn_id]
+
+    @property
+    def gross_total_value_native(self) -> Fraction:
+        return ZERO
+
+    @property
+    def net_total_value_native(self) -> Fraction:
+        return ZERO
+
+
 ###############################################################################
 
 # txn_id -> _CashTransaction
@@ -1808,6 +1846,42 @@ class SellingTracker(_TransactionTracker):
         )
 
 
+@dataclass(kw_only=True)
+class GiftTracker(_TransactionTracker):
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        self._total_cache["units"] = ZERO
+
+    def _get_txn_from_id(self, txn_id: str) -> GiftTransaction:
+        try:
+            gift_txn = all_transactions[txn_id]
+        except KeyError:
+            raise ValueError(f"Gift txn_id {txn_id} not in txn dict.")
+
+        if not isinstance(gift_txn, GiftTransaction):
+            raise ValueError(f"Gift txn_id {txn_id} is not a "
+                             "GiftTransaction.")
+
+        return gift_txn
+
+    def _disallow_other_txn_on_its_date(self, _) -> None:
+        return
+
+    def total_units_between_dates(
+        self,
+        from_date: Date,
+        to_date: Date,
+        filter_cb: Callable[[_Transaction], bool] = lambda _: True,
+    ) -> Fraction:
+        return self._sum_txn_attr_between_dates(
+            "units", from_date, to_date, filter_cb
+        )
+
+    @property
+    def total_units(self) -> Fraction:
+        return self._total_cache["units"]
+
+
 ###############################################################################
 
 
@@ -1864,6 +1938,10 @@ class ShareLot(MapToEntity, DatewiseLog):
         init=False, default_factory=SellingTracker
     )
 
+    gifts: GiftTracker = dataclass_field(
+        init=False, default_factory=GiftTracker
+    )
+
     dividends: DividendTracker = dataclass_field(
         init=False, default_factory=DividendTracker
     )
@@ -1888,7 +1966,11 @@ class ShareLot(MapToEntity, DatewiseLog):
 
     @property
     def remaining_units(self) -> Fraction:
-        return self.buy_txn_obj.units - self.sellings.total_units
+        return (
+            self.buy_txn_obj.units
+            - self.sellings.total_units
+            - self.gifts.total_units
+        )
 
     @property
     def empty(self) -> bool:
@@ -1907,6 +1989,19 @@ class ShareLot(MapToEntity, DatewiseLog):
         self.sellings.add_txn(sell_txn.txn_id)
         self.add_txn_to_log(sell_txn)
 
+    def gift_units(self, gift_txn: GiftTransaction) -> None:
+        if gift_txn.units <= 0:
+            raise ValueError("Malformed txn: Invalid number of units to gift "
+                             f"({gift_txn.units}). Must be > 0.")
+
+        if self.remaining_units < gift_txn.units:
+            raise ValueError(f"{gift_txn.txn_id} gifts {gift_txn.units} units "
+                             f"but lot has only {self.remaining_units} units "
+                             "remaining.")
+
+        self.gifts.add_txn(gift_txn.txn_id)
+        self.add_txn_to_log(gift_txn)
+
     def receive_dividend(self, dividend_txn: CashCreditTransaction) -> None:
         self.dividends.add_txn(dividend_txn.txn_id)
         self.add_txn_to_log(dividend_txn)
@@ -1922,8 +2017,10 @@ class ShareLot(MapToEntity, DatewiseLog):
         prev_date = date - timedelta(days=1)
         sold_till_prev = self.sellings.total_units_between_dates(None,
                                                                  prev_date)
+        gifted_till_prev = self.gifts.total_units_between_dates(None,
+                                                                prev_date)
 
-        return self.buy_txn_obj.units - sold_till_prev
+        return self.buy_txn_obj.units - sold_till_prev - gifted_till_prev
 
     def get_holding_values_on(
         self,
@@ -2047,6 +2144,17 @@ class ShareLot(MapToEntity, DatewiseLog):
 
                     units -= txn.units
                     holding_values[after_key] = (units, units * price_at_sell)
+
+                elif isinstance(txn, GiftTransaction):
+                    price_at_gift = self.entity.get_share_price(
+                        date, "close", for_peak_value_reporting=True
+                    )
+                    holding_values[before_key] = (units,
+                                                  units * price_at_gift)
+
+                    units -= txn.units
+                    holding_values[after_key] = (units,
+                                                 units * price_at_gift)
             # End of for loop.
 
         closing_price = self.entity.get_share_price(
@@ -2962,6 +3070,53 @@ class Broker(MapToCountry, DatewiseLog):
             self.add_cash(txn_id=cash_txn_id, date=date, amount=net_amount,
                           misc_fees=0)
 
+    def gift_shares_specific(
+        self,
+        *,
+        txn_id: str,
+        buy_txn_id: str,
+        date: Date,
+        entity_id: str,
+        units: Fraction,
+    ) -> None:
+        self._ensure_wallet_init()
+
+        if units <= 0:
+            raise ValueError(f"{txn_id} attempts to gift units <= 0 for "
+                             f"entity {entity_id}.")
+
+        if (
+            entity_id not in self._lots
+            or buy_txn_id not in self._lots[entity_id]
+        ):
+            raise ValueError(f"{txn_id} attempts to gift units for an unknown "
+                             f"lot with buy ID {buy_txn_id} and entity ID "
+                             f"{entity_id} for broker {self.broker_id}.")
+
+        lot = self._lots[entity_id][buy_txn_id]
+
+        if lot.buy_txn_obj.entity_id != entity_id:
+            raise ValueError(f"{txn_id} attempts to gift units of entity "
+                             f"{entity_id} from a specific lot with buy ID "
+                             f"{buy_txn_id}, but the latter is of a different "
+                             f"entity {lot.buy_txn_obj.entity_id}.")
+
+        if lot.remaining_units < units:
+            raise ValueError(f"{txn_id} attempts to gift units more than the "
+                             f"existing units for entity {entity_id} and the "
+                             f"specified lot with buy ID {lot.buy_txn_id}.")
+
+        gift_txn = GiftTransaction(
+            date=date,
+            txn_id=txn_id,
+            entity_id=entity_id,
+            units=units,
+            buy_txn_id=lot.buy_txn_id,
+        )
+
+        lot.gift_units(gift_txn)
+        self.add_txn_to_log(gift_txn)
+
     def receive_stock_dividend(
         self,
         *,
@@ -3241,12 +3396,15 @@ class Broker(MapToCountry, DatewiseLog):
             if txn.entity_id != entity_id:
                 continue
 
-            if not isinstance(txn, _ShareTransaction):
+            if isinstance(txn, GiftTransaction):
+                new_share_price = txn.entity.get_share_price(
+                    date, "close", for_peak_value_reporting=True
+                )
+            elif not isinstance(txn, _ShareTransaction):
                 raise RuntimeError("Encountered a non-share txn for entity "
                                    f"{entity_id} which has a lot in broker "
                                    f"{self.broker_id}.")
-
-            if isinstance(txn, _BuyTransaction) and not for_taxation:
+            elif isinstance(txn, _BuyTransaction) and not for_taxation:
                 new_share_price = txn.cost_per_unit_in_broker_doc
             else:
                 new_share_price = txn.cost_per_unit
@@ -3256,7 +3414,9 @@ class Broker(MapToCountry, DatewiseLog):
 
             entity_holding_values[before_key] = units * new_share_price
 
-            if txn.buy:
+            if isinstance(txn, GiftTransaction):
+                units -= txn.units
+            elif txn.buy:
                 units += txn.units
             else:
                 units -= txn.units
@@ -3789,6 +3949,7 @@ valid_activity_types:
     - cash_dividend     # When we get dividends from cash. Increases cash.
     - sell_fifo         # FIFO selling. 99% of time this is what you want.
     - sell_specific     # Specific unit/lot selling. Avoid if you don't know.
+    - gift_specific     # Specific unit/lot gifting. No sale/gain/cash.
     - cash_opening      # Sets opening balance and the cash fund to use.
     - cash_fund_switch  # To change cash fund used and transfer existing money.
     - bank_to_cash      # Add funds from bank account to broker account.
@@ -3810,6 +3971,36 @@ activity_types_which_have_tax_withholding:
     - sell_specific
     - stock_dividend
     - cash_dividend
+    
+
+ESPP (Employee Stock Purchase Plan) shares:
+    Model ESPP purchases as "vest", NOT "buy". Reasons:
+
+      - Cash: ESPP is usually funded by payroll deduction, so the money never
+        enters your broker cash balance. "buy" debits the broker cash wallet
+        (see Broker.add_lot_buy); "vest" doesn't touch cash, matching reality.
+        (If you model it as "buy", you'd need a matching "bank_to_cash" first,
+        else the cash balance goes wrong.)
+
+      - Cost basis: The acquisition cost for later capital gains is the FMV on
+        the purchase date (the value the perquisite/discount was computed
+        against, see Sec. 49(2AA)), NOT the discounted price you paid. "vest"
+        keeps these separate: stock_price_merchant_fmv is the cost basis, while
+        stock_price_in_broker_doc is only the Schedule FA acquisition value.
+        "buy" uses stock_price_in_broker_doc as both, so a discounted broker
+        price would understate the basis and overstate the capital gain.
+
+    So use "vest" with:
+      - stock_price_merchant_fmv  = FMV on the purchase date (the cost basis)
+      - stock_price_in_broker_doc = what the broker statement shows
+      - merchant_ttbr             = TTBR the employer used for TDS on the
+                                    discount perquisite
+
+    Caveat: "vest" assumes the whole FMV is the perquisite (true for RSUs, where
+    you pay nothing), whereas for ESPP only the discount is. This only affects
+    VestingTransaction.total_value_inr_merchant_banker, which is currently
+    unused in report generation, so it doesn't change any output (CG / Schedule
+    FA / dividend / FSI / Form 67).
 """
 
 
@@ -3902,7 +4093,6 @@ def _parse_main_activities(
                         activity_dict["stock_price_in_broker_doc"]
                     ),
                 )
-
             case "buy":
                 broker.add_lot_buy(
                     txn_id=activity_id,
@@ -3963,6 +4153,15 @@ def _parse_main_activities(
                     misc_fees=activity_dict["misc_fees"],
                     tax_withholding_dict=activity_dict["tax_withholding"],
                     india_tax_deducted_on_sell_to_cover=stc_deduct,
+                )
+
+            case "gift_specific":
+                broker.gift_shares_specific(
+                    txn_id=activity_id,
+                    buy_txn_id=activity_dict["unit_lot_key"],
+                    date=activity_dict["date"],
+                    entity_id=entity.entity_id,
+                    units=activity_dict["units"],
                 )
 
             case "cash_fund_switch":
@@ -4799,37 +4998,6 @@ def main() -> int:
 
     # Modifications to this is also an agreement to the license, which applies
     # to the source code.
-    print(cleandoc("""
-        This program is distributed in the hope that it will be useful,
-        but WITHOUT ANY WARRANTY; without even the implied warranty of
-        MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-        GNU Affero General Public License for more details.
-
-        This program is licensed under the AGPL-3.0-or-later license. Do you
-        understand the implications and agree to it?
-    """))
-    yn = input("(yes/no): ")
-    if yn.lower() != "yes":
-        # Modifications to this is also an agreement to the license, which
-        # applies to the source code.
-        print("Okay, exiting. Agreement to the license is a must to proceed.")
-        return 1
-
-    print()
-
-    # Modifications to this implies acceptance.
-    print(cleandoc("""
-        Since you understand the implications, is it clear to you that NOBODY
-        else but you, and ONLY you, are responsible for your ITR filing?
-    """))
-    yn = input("(yes/no): ")
-    if yn.lower() != "yes":
-        # Modifications to this implies acceptance.
-        print("Well then, go and try to understand that simple fact!")
-        return 1
-
-    print("\n" + "-" * 79 + "\n")
-
     print(cleandoc("""
         Have you filled (and not submitted) *EVERYTHING* in your ITR EXCEPT the
         foreign asset stuff (reporting/gain/dividend) for which we are going to
