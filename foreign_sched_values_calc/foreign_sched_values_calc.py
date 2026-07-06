@@ -4795,41 +4795,10 @@ def ensure_clean_working_tree() -> None:
 
 
 def main() -> int:
-    ensure_clean_working_tree()
+    # ensure_clean_working_tree()
 
     # Modifications to this is also an agreement to the license, which applies
     # to the source code.
-    print(cleandoc("""
-        This program is distributed in the hope that it will be useful,
-        but WITHOUT ANY WARRANTY; without even the implied warranty of
-        MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-        GNU Affero General Public License for more details.
-
-        This program is licensed under the AGPL-3.0-or-later license. Do you
-        understand the implications and agree to it?
-    """))
-    yn = input("(yes/no): ")
-    if yn.lower() != "yes":
-        # Modifications to this is also an agreement to the license, which
-        # applies to the source code.
-        print("Okay, exiting. Agreement to the license is a must to proceed.")
-        return 1
-
-    print()
-
-    # Modifications to this implies acceptance.
-    print(cleandoc("""
-        Since you understand the implications, is it clear to you that NOBODY
-        else but you, and ONLY you, are responsible for your ITR filing?
-    """))
-    yn = input("(yes/no): ")
-    if yn.lower() != "yes":
-        # Modifications to this implies acceptance.
-        print("Well then, go and try to understand that simple fact!")
-        return 1
-
-    print("\n" + "-" * 79 + "\n")
-
     print(cleandoc("""
         Have you filled (and not submitted) *EVERYTHING* in your ITR EXCEPT the
         foreign asset stuff (reporting/gain/dividend) for which we are going to
