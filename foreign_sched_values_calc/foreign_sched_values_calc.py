@@ -3126,9 +3126,46 @@ class Broker(MapToCountry, DatewiseLog):
         amount: Fraction,
         misc_fees: Fraction,
         tax_withholding_dict: dict[str, Fraction],
+        ex_date: Date = None,
     ) -> None:
+        """
+        The dividend is disbursed per-share, but the broker statement only gives
+        us the aggregate `amount` for the whole holding. We therefore split it
+        back among the lots proportionally by units.
+
+        `date` is the *payment date* -- when the cash is credited, and hence the
+        date used for the transaction, TTBR and CY/FY bucketing.
+
+        Eligibility, however, is fixed on the *ex-dividend date*: you earn the
+        dividend on shares you already held before the stock went ex-dividend,
+        even if you sell them before the payment date. If `ex_date` is given, we
+        therefore size each lot by the units it held at the start of `ex_date`
+        (`opening_units_on`), so lots sold between ex-date and payment date still
+        get their share and lots bought on/after ex-date get nothing. Without
+        `ex_date` we fall back to the units still held at payment time, which is
+        wrong whenever shares are acquired or sold in that window.
+        """
         self._ensure_wallet_init()
-        total_units = self._total_units_in_all_lots(entity_id)
+
+        if ex_date is not None and ex_date > date:
+            raise ValueError(
+                f"Dividend {txn_id}: ex_date {ex_date} is after the payment "
+                f"date {date}. The ex-dividend date must precede payment."
+            )
+
+        def eligible_units(lot: "ShareLot") -> Fraction:
+            """Units of `lot` that earned this dividend."""
+            if ex_date is None:
+                return lot.remaining_units
+            # Bought on/after ex-date -> not entitled to this dividend.
+            if lot.buy_txn_obj.date >= ex_date:
+                return ZERO
+            return lot.opening_units_on(ex_date)
+
+        all_lots = [lot for lot in self._lots[entity_id].values()
+                    if eligible_units(lot) > 0]
+
+        total_units = sum((eligible_units(lot) for lot in all_lots), ZERO)
 
         if total_units == 0:
             raise ValueError(f"Cannot distribute dividend {amount} for entity "
@@ -3140,9 +3177,6 @@ class Broker(MapToCountry, DatewiseLog):
         total_tax_withheld = tax_withholding_dict["amount"]
         tax_withheld_per_unit = total_tax_withheld / total_units
 
-        all_lots = [lot for lot in self._lots[entity_id].values()
-                    if lot.remaining_units > 0]
-
         last_lot_index = len(all_lots) - 1
 
         dividend_disbursed_in_lots = ZERO
@@ -3153,8 +3187,9 @@ class Broker(MapToCountry, DatewiseLog):
         misc_fees_per_each_lot = misc_fees / len(all_lots)
 
         for index, lot in enumerate(all_lots):
-            dividend_for_lot = dividend_per_unit * lot.remaining_units
-            tax_withheld_for_lot = tax_withheld_per_unit * lot.remaining_units
+            lot_units = eligible_units(lot)
+            dividend_for_lot = dividend_per_unit * lot_units
+            tax_withheld_for_lot = tax_withheld_per_unit * lot_units
             misc_fees_for_lot = misc_fees_per_each_lot
 
             dividend_disbursed_in_lots += dividend_for_lot
@@ -4110,6 +4145,7 @@ def _parse_main_activities(
                     amount=activity_dict["amount"],
                     misc_fees=activity_dict["misc_fees"],
                     tax_withholding_dict=activity_dict["tax_withholding"],
+                    ex_date=activity_dict.get("ex_date"),
                 )
 
             case "cash_dividend":
