@@ -376,12 +376,15 @@ class Country(_BasePostInit):
     code: str
     currency: str
     tax_withholding_rate_percent_for_dividend: Fraction
+    tax_withholding_rate_percent_for_interest: Fraction
     tax_withholding_rate_percent_for_ltcg: Fraction
     tax_withholding_rate_percent_for_stcg: Fraction
     dtaa_article_dividend: str
+    dtaa_article_interest: str
     dtaa_article_ltcg: str
     dtaa_article_stcg: str
     dtaa_tax_rate_percent_dividend: Fraction
+    dtaa_tax_rate_percent_interest: Fraction
     dtaa_tax_rate_percent_ltcg: Fraction
     dtaa_tax_rate_percent_stcg: Fraction
     tin_or_passport: str
@@ -410,6 +413,10 @@ class Country(_BasePostInit):
 
         if not (article := self.dtaa_article_dividend).isdigit():
             raise ValueError(f"Invalid non-number dividend article {article} "
+                             f"for country {self.country_id} DTAA.")
+
+        if not (article := self.dtaa_article_interest).isdigit():
+            raise ValueError(f"Invalid non-number interest article {article} "
                              f"for country {self.country_id} DTAA.")
 
         if not (article := self.dtaa_article_ltcg).isdigit():
@@ -1376,8 +1383,18 @@ class _CashTransaction(_Transaction, _TotalValueMixin):
 
 @dataclass(kw_only=True)
 class CashCreditTransaction(_CashTransaction, _TaxWithholdingAndFees):
+    # Both dividend and interest credits use this class, but they withhold at
+    # different country rates. "dividend" covers cash/stock dividends and plain
+    # credits (bank_to_cash etc., which withhold nothing); "interest" covers
+    # interest on the cash balance.
+    income_type: str = "dividend"
+
     def __post_init__(self) -> None:
         super().__post_init__()
+
+        if self.income_type not in ("dividend", "interest"):
+            raise ValueError(f"Unknown income_type {self.income_type!r} for "
+                             f"cash transaction '{self.txn_id}'.")
 
         if self.total_deduction_native > self.amount:
             raise ValueError("total_deduction_native > gross amount for cash "
@@ -1389,6 +1406,8 @@ class CashCreditTransaction(_CashTransaction, _TaxWithholdingAndFees):
 
     @property
     def tax_withholding_rate_in_country_for_this_type(self) -> Fraction:
+        if self.income_type == "interest":
+            return self.country.tax_withholding_rate_percent_for_interest / 100
         return self.country.tax_withholding_rate_percent_for_dividend / 100
 
     @property
@@ -1540,6 +1559,75 @@ class DividendTracker(_TransactionTracker):
             raise ValueError(
                 f"Dividend txn_id {txn.txn_id} is of date {txn.date}, but "
                 "there already exists a dividend on that date."
+            )
+
+    def gross_total_value_inr_for_tax_between_dates(
+        self,
+        from_date: Date,
+        to_date: Date,
+        filter_cb: Callable[[_Transaction], bool] = lambda _: True,
+    ) -> Fraction:
+        return self._sum_txn_attr_between_dates(
+            "gross_total_value_inr_for_tax", from_date, to_date, filter_cb
+        )
+
+    def total_tax_withheld_inr_between_dates(
+        self,
+        from_date: Date,
+        to_date: Date,
+        filter_cb: Callable[[_Transaction], bool] = lambda _: True,
+    ) -> Fraction:
+        return self._sum_txn_attr_between_dates(
+            "tax_withheld_inr", from_date, to_date, filter_cb
+        )
+
+    def gross_total_amount_inr_for_which_tax_was_withheld_between_dates(
+        self,
+        from_date: Date,
+        to_date: Date,
+        filter_cb: Callable[[_Transaction], bool] = lambda _: True,
+    ) -> Fraction:
+        return self._sum_txn_attr_between_dates(
+            "gross_total_value_inr_for_tax",
+            from_date,
+            to_date,
+            lambda txn: (txn.tax_withholding_amount_native != 0
+                         and filter_cb(txn)),
+        )
+
+
+@dataclass(kw_only=True)
+class InterestTracker(_TransactionTracker):
+    """
+    Interest on cash balances. Mechanically identical to a dividend on cash -- no lots,
+    just a cash credit -- but it is a distinct tax head (Schedule OS interest line,
+    Schedule FA "Nature of Amount" = I, DTAA Article 11 vs dividend's Article 10),
+    so it lives in its own bucket. See DividendTracker, which this mirrors.
+    """
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+    def _get_txn_from_id(self, txn_id: str) -> CashCreditTransaction:
+        try:
+            interest_txn = all_cash_transactions[txn_id]
+        except KeyError:
+            raise ValueError(f"Interest txn_id {txn_id} not in cash txn dict.")
+
+        if not isinstance(interest_txn, CashCreditTransaction):
+            raise ValueError(f"Interest txn_id {txn_id} is not a "
+                             "CashCreditTransaction.")
+
+        return interest_txn
+
+    def _disallow_other_txn_on_its_date(
+        self,
+        txn: CashCreditTransaction
+    ) -> None:
+        if txn.date in self._history:
+            raise ValueError(
+                f"Interest txn_id {txn.txn_id} is of date {txn.date}, but "
+                "there already exists an interest entry on that date."
             )
 
     def gross_total_value_inr_for_tax_between_dates(
@@ -2387,6 +2475,12 @@ class CashWallet(MapToEntity, DatewiseLog):
         init=False, default_factory=DividendTracker
     )
 
+    # Likewise for interest -- a cash credit that is also tracked here so it
+    # can be reported under its own tax head (see InterestTracker).
+    interest: InterestTracker = dataclass_field(
+        init=False, default_factory=InterestTracker
+    )
+
     def __post_init__(self) -> None:
         super().__post_init__()
 
@@ -2424,6 +2518,7 @@ class CashWallet(MapToEntity, DatewiseLog):
         amount: Fraction,
         misc_fees: Fraction,
         tax_withholding_dict: dict[str, Fraction],
+        income_type: str = "dividend",
     ) -> CashCreditTransaction:
         self._ensure_not_closed()
 
@@ -2435,6 +2530,7 @@ class CashWallet(MapToEntity, DatewiseLog):
             misc_fees=misc_fees,
             tax_withholding_rate=(tax_withholding_dict["rate_percent"] / 100),
             tax_withholding_amount_native=tax_withholding_dict["amount"],
+            income_type=income_type,
         )
 
         self.credits.add_txn(txn.txn_id)
@@ -2483,6 +2579,17 @@ class CashWallet(MapToEntity, DatewiseLog):
         self.dividends.add_txn(dividend_txn.txn_id)
 
         return dividend_txn
+
+    def receive_interest_from_self_into_self(
+        self,
+        **kwargs
+    ) -> CashCreditTransaction:
+        self._ensure_not_closed()
+
+        interest_txn = self.credit(income_type="interest", **kwargs)
+        self.interest.add_txn(interest_txn.txn_id)
+
+        return interest_txn
 
     def close(self, date: Date) -> None:
         self._ensure_not_closed()
@@ -2638,6 +2745,51 @@ class CashWallet(MapToEntity, DatewiseLog):
         date_in_installment = globals()[func_name]
 
         return self.dividends.gross_total_value_inr_for_tax_between_dates(
+            fy_start(), fy_end(), lambda txn: date_in_installment(txn.date)
+        )
+
+    @property
+    def total_interest_native_in_calendar_year(self) -> Fraction:
+        return self.interest.gross_total_value_native_between_dates(
+            cy_start(), cy_end()
+        )
+
+    @property
+    def total_interest_inr_in_calendar_year(self) -> Fraction:
+        return self.country.convert_to_inr_for_FA_income(
+            self.total_interest_native_in_calendar_year
+        )
+
+    @property
+    def total_interest_inr_in_financial_year_for_tax(self) -> Fraction:
+        return self.interest.gross_total_value_inr_for_tax_between_dates(
+            fy_start(), fy_end()
+        )
+
+    @property
+    def total_tax_withheld_on_interest_inr_in_financial_year(
+        self,
+    ) -> Fraction:
+        return self.interest.total_tax_withheld_inr_between_dates(
+            fy_start(), fy_end()
+        )
+
+    @property
+    def interest_amount_inr_for_which_tax_was_withheld_in_financial_year(
+        self
+    ) -> Fraction:
+        return self.interest.gross_total_amount_inr_for_which_tax_was_withheld_between_dates(  # noqa: E501
+            fy_start(), fy_end()
+        )
+
+    def total_interest_amount_inr_for_advance_tax_installment(
+        self,
+        installment: int,
+    ) -> Fraction:
+        func_name = f"date_in_fy_advance_tax_installment_{installment}"
+        date_in_installment = globals()[func_name]
+
+        return self.interest.gross_total_value_inr_for_tax_between_dates(
             fy_start(), fy_end(), lambda txn: date_in_installment(txn.date)
         )
 
@@ -3305,6 +3457,14 @@ class Broker(MapToCountry, DatewiseLog):
         )
         self.add_txn_to_log(dividend_txn)
 
+    def receive_interest(self, **kwargs) -> None:
+        """Interest is paid on the cash balance; like cash, it has no lots."""
+        self._ensure_wallet_init()
+        interest_txn = self._wallet.receive_interest_from_self_into_self(
+            **kwargs
+        )
+        self.add_txn_to_log(interest_txn)
+
     def get_cash_balances_on(self, date: Date) -> Fraction:
         """
         Get all possible cash balances in account as on a date, as transactions
@@ -3765,6 +3925,68 @@ class Broker(MapToCountry, DatewiseLog):
         attr = "dividend_amount_inr_for_which_tax_was_withheld_in_financial_year"  # noqa: E501
         return self._sum_all_cash_and_stocks(attr)
 
+    def _sum_all_cash(
+        self,
+        attr: str,
+        attr_args: list[Any] = None,
+    ) -> Fraction:
+        """
+        Like _sum_all_cash_and_stocks(), but sums over cash wallets only.
+
+        Interest is paid on the cash balance, never on stock lots, so ShareLot
+        has no interest attributes; summing over lots would raise
+        AttributeError.
+        """
+        self._ensure_wallet_init()
+
+        def get_attr_val(obj: object) -> Fraction:
+            attr_value = getattr(obj, attr)
+            return attr_value(*attr_args) if attr_args else attr_value
+
+        return sum(
+            (get_attr_val(wallet) for wallet in self._all_wallets),
+            ZERO,
+        )
+
+    @property
+    def total_interest_native_in_calendar_year(self) -> Fraction:
+        return self._sum_all_cash("total_interest_native_in_calendar_year")
+
+    @property
+    def total_interest_inr_in_calendar_year(self) -> Fraction:
+        return self.country.convert_to_inr_for_FA_income(
+            self.total_interest_native_in_calendar_year
+        )
+
+    @property
+    def total_interest_inr_in_financial_year_for_tax(self) -> Fraction:
+        return self._sum_all_cash(
+            "total_interest_inr_in_financial_year_for_tax"
+        )
+
+    @property
+    def total_tax_withheld_on_interest_inr_in_financial_year(self) -> Fraction:
+        return self._sum_all_cash(
+            "total_tax_withheld_on_interest_inr_in_financial_year"
+        )
+
+    @property
+    def interest_amount_inr_for_which_tax_was_withheld_in_financial_year(
+        self
+    ) -> Fraction:
+        return self._sum_all_cash(
+            "interest_amount_inr_for_which_tax_was_withheld_in_financial_year"
+        )
+
+    def total_interest_amount_inr_for_advance_tax_installment(
+        self,
+        installment: int,
+    ) -> Fraction:
+        return self._sum_all_cash(
+            "total_interest_amount_inr_for_advance_tax_installment",
+            [installment],
+        )
+
     @property
     def total_captial_gain_inr_in_financial_year_for_tax(self) -> Fraction:
         return sum(
@@ -3982,6 +4204,7 @@ valid_activity_types:
     - buy               # Cash is used up for buying.
     - stock_dividend    # When we get dividends from stocks. Increases cash.
     - cash_dividend     # When we get dividends from cash. Increases cash.
+    - interest          # Interest on the cash balance. Increases cash.
     - sell_fifo         # FIFO selling. 99% of time this is what you want.
     - sell_specific     # Specific unit/lot selling. Avoid if you don't know.
     - gift_specific     # Specific unit/lot gifting. No sale/gain/cash.
@@ -4006,7 +4229,8 @@ activity_types_which_have_tax_withholding:
     - sell_specific
     - stock_dividend
     - cash_dividend
-    
+    - interest
+
 
 ESPP (Employee Stock Purchase Plan) shares:
     Model ESPP purchases as "vest", NOT "buy". Reasons:
@@ -4150,6 +4374,15 @@ def _parse_main_activities(
 
             case "cash_dividend":
                 broker.receive_cash_dividend(
+                    txn_id=activity_id,
+                    date=date,
+                    amount=activity_dict["amount"],
+                    misc_fees=activity_dict["misc_fees"],
+                    tax_withholding_dict=activity_dict["tax_withholding"],
+                )
+
+            case "interest":
+                broker.receive_interest(
                     txn_id=activity_id,
                     date=date,
                     amount=activity_dict["amount"],
@@ -4573,7 +4806,12 @@ def create_schedule_fa_table_a2() -> None:
         #   O - Other income
         #   N - No Amount paid/credited
         #
-        # In this program, only dividend and sale proceeds is possible.
+        # In this program, interest, dividend and sale proceeds are possible.
+
+        broker_data_interest = {
+            "Nature of Amount": "I",
+            "Amount": round_rs(broker.total_interest_inr_in_calendar_year),
+        }
 
         broker_data_dividend = {
             "Nature of Amount": "D",
@@ -4587,7 +4825,9 @@ def create_schedule_fa_table_a2() -> None:
 
         broker_rows = []
 
-        for amount_data in (broker_data_dividend, broker_data_proceeds):
+        for amount_data in (broker_data_interest,
+                            broker_data_dividend,
+                            broker_data_proceeds):
             if amount_data["Amount"] != 0:
                 broker_rows.append(broker_data_common | amount_data)
 
@@ -4666,10 +4906,12 @@ def create_capital_gain_and_dividends_and_get_average_tax_rate() -> Fraction:
         "short_term_sell": ZERO,
 
         "dividends": ZERO,
+        "interest": ZERO,
 
         "ltcg_accruals_advance_tax_installments": [],
         "stcg_accruals_advance_tax_installments": [],
         "dividend_accruals_advance_tax_installments": [],
+        "interest_accruals_advance_tax_installments": [],
     }
 
     for broker in brokers.values():
@@ -4686,12 +4928,21 @@ def create_capital_gain_and_dividends_and_get_average_tax_rate() -> Fraction:
         cg_dict["short_term_buy"] += stb
         cg_dict["short_term_sell"] += sts
 
+        print(broker.broker_id,
+              broker.total_dividends_native_in_calendar_year,
+              broker.total_dividends_inr_in_calendar_year,
+              broker.total_dividends_inr_in_financial_year_for_tax
+              )
         cg_dict["dividends"] += \
             broker.total_dividends_inr_in_financial_year_for_tax
+
+        cg_dict["interest"] += \
+            broker.total_interest_inr_in_financial_year_for_tax
 
         ltcg_accruals = []
         stcg_accruals = []
         dividend_accruals = []
+        interest_accruals = []
 
         for i in range(1, 6):
             ltcg_accruals.append(
@@ -4703,16 +4954,22 @@ def create_capital_gain_and_dividends_and_get_average_tax_rate() -> Fraction:
             dividend_accruals.append(
                 broker.total_dividend_amount_inr_for_advance_tax_installment(i)
             )
+            interest_accruals.append(
+                broker.total_interest_amount_inr_for_advance_tax_installment(i)
+            )
 
         cg_dict["ltcg_accruals_advance_tax_installments"].append(ltcg_accruals)
         cg_dict["stcg_accruals_advance_tax_installments"].append(stcg_accruals)
         cg_dict["dividend_accruals_advance_tax_installments"].append(
             dividend_accruals
         )
+        cg_dict["interest_accruals_advance_tax_installments"].append(
+            interest_accruals
+        )
     # End of for loop.
 
     # Sum / Flatten all the installments into one.
-    for key in ("ltcg", "stcg", "dividend"):
+    for key in ("ltcg", "stcg", "dividend", "interest"):
         full_key = key + "_accruals_advance_tax_installments"
         total_list = [sum(x) for x in zip(*cg_dict[full_key])]
         cg_dict[full_key] = total_list
@@ -4735,7 +4992,8 @@ def create_capital_gain_and_dividends_and_get_average_tax_rate() -> Fraction:
         Capital gain and dividend info for reference stored in {rel_path}
 
         Capital gain reporting goes in "Schedule Capital Gain".
-        Dividend reporting goes in "Schedule Other Sources".
+        Dividend and interest reporting goes in "Schedule Other Sources"
+        (on their respective separate lines).
 
         In the schedules, the total value has to be reported, so add the values
         we calculated to the existing values if any, making sure the existing
@@ -4783,6 +5041,10 @@ def get_earnings_per_country() -> dict[str, dict[str, Fraction]]:
                 "dividend_without_tax_withheld": ZERO,
                 "dividend_with_tax_withheld": ZERO,
                 "tax_withheld_on_dividend": ZERO,
+
+                "interest_without_tax_withheld": ZERO,
+                "interest_with_tax_withheld": ZERO,
+                "tax_withheld_on_interest": ZERO,
             }
 
         # LTCG:
@@ -4829,6 +5091,21 @@ def get_earnings_per_country() -> dict[str, dict[str, Fraction]]:
 
         country_id_to_data[country_id]["tax_withheld_on_dividend"] += \
             broker.total_tax_withheld_on_dividends_inr_in_financial_year
+
+        # Interest:
+
+        interest = broker.total_interest_inr_in_financial_year_for_tax
+        interest_with_witholding = \
+            broker.interest_amount_inr_for_which_tax_was_withheld_in_financial_year  # noqa: E501
+
+        country_id_to_data[country_id]["interest_without_tax_withheld"] += \
+            interest - interest_with_witholding
+
+        country_id_to_data[country_id]["interest_with_tax_withheld"] += \
+            interest_with_witholding
+
+        country_id_to_data[country_id]["tax_withheld_on_interest"] += \
+            broker.total_tax_withheld_on_interest_inr_in_financial_year
     # End of for loop.
 
     return country_id_to_data
@@ -4846,7 +5123,7 @@ def create_schedule_fsi_and_form_67(avg_tax_rate: Fraction) -> None:
         tax_withheld: Fraction,
     ) -> None:
         income_type_mapping = {"ltcg": "LTCG", "stcg": "STCG",
-                               "dividend": "Dividend"}
+                               "dividend": "Dividend", "interest": "Interest"}
 
         income_type = income_type_mapping[income_type_suffix_for_attr]
         income_type += " without" if tax_withheld == 0 else " with"
@@ -4888,6 +5165,7 @@ def create_schedule_fsi_and_form_67(avg_tax_rate: Fraction) -> None:
             "ltcg": "Long term capital gain",
             "stcg": "Short term capital gain",
             "dividend": "Dividend",
+            "interest": "Interest",
         }
 
         def country_attr(attr: str) -> Any:
@@ -4980,6 +5258,22 @@ def create_schedule_fsi_and_form_67(avg_tax_rate: Fraction) -> None:
                 "dividend",
                 data["dividend_with_tax_withheld"],
                 data["tax_withheld_on_dividend"],
+            )
+            add_to_fsi(*args)
+            add_to_form67(*args)
+
+        # Make entry for interest without withholding.
+        if data["interest_without_tax_withheld"] != 0:
+            add_to_fsi(country, "interest",
+                       data["interest_without_tax_withheld"], ZERO)
+
+        # Make entry for interest with withholding.
+        if data["interest_with_tax_withheld"] != 0:
+            args = (
+                country,
+                "interest",
+                data["interest_with_tax_withheld"],
+                data["tax_withheld_on_interest"],
             )
             add_to_fsi(*args)
             add_to_form67(*args)
