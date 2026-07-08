@@ -4161,11 +4161,19 @@ def get_activity_values(
     entity_id = activity_dict.get("entity")
     entity = entities[entity_id] if entity_id else None
 
-    if entity and entity.country_id != broker.country_id:
+    # Cash is held at the institution, so a cash entity's country must match
+    # the broker's. Securities, however, have their own domicile and may differ
+    # (e.g. an Ireland-domiciled ETF held in a US brokerage account); their
+    # source country is tracked via the entity, not the broker.
+    if (
+        entity
+        and entity.cash_type
+        and entity.country_id != broker.country_id
+    ):
         raise ValueError(
-            f"Specified entity {entity.entity_id} of country "
-            f"{entity.country_id}, and broker {broker.broker_id} of "
-            f"country {broker.country_id}."
+            f"Cash entity {entity.entity_id} of country "
+            f"{entity.country_id} must match its broker {broker.broker_id} "
+            f"of country {broker.country_id}."
         )
 
     return activity_id, activity_type, activity_dict, entity, broker
@@ -5022,91 +5030,86 @@ def create_capital_gain_and_dividends_and_get_average_tax_rate() -> Fraction:
 
 
 def get_earnings_per_country() -> dict[str, dict[str, Fraction]]:
+    """
+    Foreign income (for Schedule FSI / Form 67) bucketed by *source* country.
+
+    The source of an income is the domicile of the asset that produced it, not
+    the country of the broker/account holding it. A US broker (e.g. IBKR) can
+    hold an Ireland-domiciled ETF: interest on the account's cash is US-source,
+    while dividends and capital gains on that ETF are Ireland-source. We
+    therefore attribute each income item by its own `.country` (which
+    `MapToEntity.country` resolves to the entity's domicile):
+
+      - capital gains and stock dividends -> the lot's (security's) domicile,
+      - cash dividends and interest       -> the cash wallet's country (cash is
+        held at the institution, so this equals the broker country).
+
+    This is deliberately independent of `broker.country`, which is used only
+    for the Schedule FA Table A2 institution/account reporting.
+    """
     country_id_to_data = {}
 
+    def bucket(country: Country) -> dict[str, Fraction]:
+        return country_id_to_data.setdefault(country.country_id, {
+            "ltcg_without_tax_withheld": ZERO,
+            "ltcg_with_tax_withheld": ZERO,
+            "tax_withheld_on_ltcg": ZERO,
+
+            "stcg_without_tax_withheld": ZERO,
+            "stcg_with_tax_withheld": ZERO,
+            "tax_withheld_on_stcg": ZERO,
+
+            "dividend_without_tax_withheld": ZERO,
+            "dividend_with_tax_withheld": ZERO,
+            "tax_withheld_on_dividend": ZERO,
+
+            "interest_without_tax_withheld": ZERO,
+            "interest_with_tax_withheld": ZERO,
+            "tax_withheld_on_interest": ZERO,
+        })
+
+    def add(data: dict, prefix: str, total: Fraction,
+            with_wh: Fraction, tax_withheld: Fraction) -> None:
+        data[f"{prefix}_without_tax_withheld"] += total - with_wh
+        data[f"{prefix}_with_tax_withheld"] += with_wh
+        data[f"tax_withheld_on_{prefix}"] += tax_withheld
+
     for broker in brokers.values():
-        country = broker.country
-        country_id = country.country_id
+        broker._ensure_wallet_init()
 
-        if country_id not in country_id_to_data:
-            country_id_to_data[country_id] = {
-                "ltcg_without_tax_withheld": ZERO,
-                "ltcg_with_tax_withheld": ZERO,
-                "tax_withheld_on_ltcg": ZERO,
+        # Capital gains and stock dividends -> security domicile (per lot).
+        for lot_map in broker._lots.values():
+            for lot in lot_map.values():
+                data = bucket(lot.country)
 
-                "stcg_without_tax_withheld": ZERO,
-                "stcg_with_tax_withheld": ZERO,
-                "tax_withheld_on_stcg": ZERO,
+                add(data, "ltcg",
+                    lot.total_ltcg_amount_inr_in_financial_year,
+                    lot.ltcg_amount_inr_for_which_tax_was_withheld_in_financial_year,  # noqa: E501
+                    lot.total_ltcg_tax_withheld_inr_in_financial_year)
 
-                "dividend_without_tax_withheld": ZERO,
-                "dividend_with_tax_withheld": ZERO,
-                "tax_withheld_on_dividend": ZERO,
+                add(data, "stcg",
+                    lot.total_stcg_amount_inr_in_financial_year,
+                    lot.stcg_amount_inr_for_which_tax_was_withheld_in_financial_year,  # noqa: E501
+                    lot.total_stcg_tax_withheld_inr_in_financial_year)
 
-                "interest_without_tax_withheld": ZERO,
-                "interest_with_tax_withheld": ZERO,
-                "tax_withheld_on_interest": ZERO,
-            }
+                add(data, "dividend",
+                    lot.total_dividends_inr_in_financial_year_for_tax,
+                    lot.dividend_amount_inr_for_which_tax_was_withheld_in_financial_year,  # noqa: E501
+                    lot.total_tax_withheld_on_dividends_inr_in_financial_year)
 
-        # LTCG:
+        # Cash dividends and interest -> the cash wallet's country.
+        for wallet in broker._all_wallets:
+            data = bucket(wallet.country)
 
-        ltcg = broker.total_ltcg_amount_inr_in_financial_year
-        ltcg_with_witholding = \
-            broker.ltcg_amount_inr_for_which_tax_was_withheld_in_financial_year
+            add(data, "dividend",
+                wallet.total_dividends_inr_in_financial_year_for_tax,
+                wallet.dividend_amount_inr_for_which_tax_was_withheld_in_financial_year,  # noqa: E501
+                wallet.total_tax_withheld_on_dividends_inr_in_financial_year)
 
-        country_id_to_data[country_id]["ltcg_without_tax_withheld"] += \
-            ltcg - ltcg_with_witholding
-
-        country_id_to_data[country_id]["ltcg_with_tax_withheld"] += \
-            ltcg_with_witholding
-
-        country_id_to_data[country_id]["tax_withheld_on_ltcg"] += \
-            broker.total_ltcg_tax_withheld_inr_in_financial_year
-
-        # STCG:
-
-        stcg = broker.total_stcg_amount_inr_in_financial_year
-        stcg_with_witholding = \
-            broker.stcg_amount_inr_for_which_tax_was_withheld_in_financial_year
-
-        country_id_to_data[country_id]["stcg_without_tax_withheld"] += \
-            stcg - stcg_with_witholding
-
-        country_id_to_data[country_id]["stcg_with_tax_withheld"] += \
-            stcg_with_witholding
-
-        country_id_to_data[country_id]["tax_withheld_on_stcg"] += \
-            broker.total_stcg_tax_withheld_inr_in_financial_year
-
-        # Dividend:
-
-        dividend = broker.total_dividends_inr_in_financial_year_for_tax
-        dividend_with_witholding = \
-            broker.dividend_amount_inr_for_which_tax_was_withheld_in_financial_year  # noqa: E501
-
-        country_id_to_data[country_id]["dividend_without_tax_withheld"] += \
-            dividend - dividend_with_witholding
-
-        country_id_to_data[country_id]["dividend_with_tax_withheld"] += \
-            dividend_with_witholding
-
-        country_id_to_data[country_id]["tax_withheld_on_dividend"] += \
-            broker.total_tax_withheld_on_dividends_inr_in_financial_year
-
-        # Interest:
-
-        interest = broker.total_interest_inr_in_financial_year_for_tax
-        interest_with_witholding = \
-            broker.interest_amount_inr_for_which_tax_was_withheld_in_financial_year  # noqa: E501
-
-        country_id_to_data[country_id]["interest_without_tax_withheld"] += \
-            interest - interest_with_witholding
-
-        country_id_to_data[country_id]["interest_with_tax_withheld"] += \
-            interest_with_witholding
-
-        country_id_to_data[country_id]["tax_withheld_on_interest"] += \
-            broker.total_tax_withheld_on_interest_inr_in_financial_year
-    # End of for loop.
+            add(data, "interest",
+                wallet.total_interest_inr_in_financial_year_for_tax,
+                wallet.interest_amount_inr_for_which_tax_was_withheld_in_financial_year,  # noqa: E501
+                wallet.total_tax_withheld_on_interest_inr_in_financial_year)
 
     return country_id_to_data
 
