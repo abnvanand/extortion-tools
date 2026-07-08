@@ -52,6 +52,17 @@
 #         tracked and reported separately from dividends.
 
 
+# Note 7b: A broker/account and the securities it holds may sit in different
+#          countries. A cash entity (the wallet) must share its broker's
+#          country -- cash is held at the institution, so interest on it is
+#          sourced there. A non-cash entity (stock/ETF/MF) may have a different
+#          country: its own domicile. Example: an Ireland-domiciled UCITS ETF
+#          held in a US brokerage account -- broker + wallet = US (interest is
+#          US-source, Schedule FA A2 institution = US), while the ETF entity =
+#          Ireland (Schedule FA A3 domicile, and the source for its dividends /
+#          capital gains in Schedule FSI / Form 67).
+
+
 # Note 8: Stock splits are not supported currently. If you want support, open
 #         a PR (preferred) or issue on GitHub.
 
