@@ -81,6 +81,19 @@
 #          If you want support, open a PR (preferred) or issue on GitHub.
 
 
+# Note 11: The "permitted_use_abroad" activity type is understood by the FEMA
+#          180-day checker (fema.py), NOT by foreign_sched_values_calc.py. It
+#          records idle foreign currency you spent abroad on a purpose FEMA
+#          permits (travel, education, medical treatment, etc.). To fema.py this
+#          is a cash debit that "stops the clock" -- exactly like reinvesting
+#          (buy) or repatriating (cash_to_bank) -- so those proceeds no longer
+#          count against the 180-day deadline. It only draws down the wallet's
+#          cash; it has no Indian tax effect (it is not income), which is why
+#          the main tax calculator ignores it. If you run the main calculator on
+#          an input that contains this activity, either keep it only in a copy
+#          used for fema.py, or model the same outflow there as a cash_to_bank.
+
+
 ###############################################################################
 
 
@@ -337,6 +350,8 @@ valid_activity_types:
     - cash_fund_switch  # To change cash fund used and transfer existing money.
     - bank_to_cash      # Add funds from bank account to broker account.
     - cash_to_bank      # Withdraw cash from broker account to bank account.
+    - permitted_use_abroad  # Spend idle forex abroad on a FEMA-permitted use
+                            # (travel/education/medical, etc.). See "Note 11".
 
 
 valid_activity_types_in_opening_ledger:
@@ -552,6 +567,14 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
         broker: fidelity_rsu
         date: 2024-09-05
         amount: 1234.5
+
+    - vacation_spend_abroad:  # See "Note 11". Understood by fema.py only.
+        activity_type: permitted_use_abroad
+        broker: robinhood_personal
+        date: 2024-09-20
+        amount: 300  # Idle USD spent abroad on a FEMA-permitted purpose (e.g.
+                     # a hotel/travel bill), which stops the 180-day clock on
+                     # that much of the wallet's oldest realized foreign cash.
 
     - STOCK_buy_personal:
         activity_type: buy
