@@ -46,8 +46,10 @@
 # Note 6: Tickers for cash type entities (like MMF) won't be verified.
 
 
-# Note 7: Currently, only dividend (and not interest) is supported for cash
-#         type entities.
+# Note 7: Both dividend (cash_dividend) and interest are supported for cash
+#         type entities. Interest is a distinct tax head (Schedule OS interest
+#         line, Schedule FA "Nature of Amount" = I, DTAA Article 11), so it is
+#         tracked and reported separately from dividends.
 
 
 # Note 8: Stock splits are not supported currently. If you want support, open
@@ -93,18 +95,24 @@ countries:
 
         # See "Note 10".
         tax_withholding_rate_percent_for_dividend: 25  # For dividends etc.
+        # For interest on cash balances. US-source bank/brokerage interest paid
+        # to a nonresident alien with a valid W-8BEN is usually exempt (0), but
+        # confirm against your Form 1042-S.
+        tax_withholding_rate_percent_for_interest: 0
         tax_withholding_rate_percent_for_ltcg: 0   # For LTCG only.
         tax_withholding_rate_percent_for_stcg: 0   # For STCG only.
 
         # We must specify DTAA article numbers, and they must be quoted.
         # Check DTAA PDFs and find the relevant article number.
         dtaa_article_dividend: "10"
+        dtaa_article_interest: "11"  # Interest is a separate DTAA article.
         dtaa_article_ltcg: "13"
         dtaa_article_stcg: "13"
 
         # DTAA specifies a tax rate for which you avoid double taxation. This
         # can be different from the tax withholding rate mentioned above.
         dtaa_tax_rate_percent_dividend: 25
+        dtaa_tax_rate_percent_interest: 15
         dtaa_tax_rate_percent_ltcg: 0  # Different rates for LTCG and STCG.
         dtaa_tax_rate_percent_stcg: 0
 
@@ -120,12 +128,15 @@ countries:
         currency: GBP
         # Some dummy values. Do not use these!
         tax_withholding_rate_percent_for_dividend: 12
+        tax_withholding_rate_percent_for_interest: 12
         tax_withholding_rate_percent_for_ltcg: 13
         tax_withholding_rate_percent_for_stcg: 14
         dtaa_article_dividend: "56"
+        dtaa_article_interest: "57"
         dtaa_article_ltcg: "78"
         dtaa_article_stcg: "79"
         dtaa_tax_rate_percent_dividend: 10
+        dtaa_tax_rate_percent_interest: 10
         dtaa_tax_rate_percent_ltcg: 15
         dtaa_tax_rate_percent_stcg: 20
         tin_or_passport: "XYZABCDEFG"
@@ -136,12 +147,15 @@ countries:
         currency: CNY
         # Some dummy values. Do not use these!
         tax_withholding_rate_percent_for_dividend: 5
+        tax_withholding_rate_percent_for_interest: 5
         tax_withholding_rate_percent_for_ltcg: 6
         tax_withholding_rate_percent_for_stcg: 7
         dtaa_article_dividend: "8"
+        dtaa_article_interest: "8"
         dtaa_article_ltcg: "9"
         dtaa_article_stcg: "9"
         dtaa_tax_rate_percent_dividend: 10
+        dtaa_tax_rate_percent_interest: 10
         dtaa_tax_rate_percent_ltcg: 11
         dtaa_tax_rate_percent_stcg: 12
         tin_or_passport: "A1234567"
@@ -305,6 +319,7 @@ valid_activity_types:
     - buy               # Cash is used up for buying.
     - stock_dividend    # When we get dividends from stocks. Increases cash.
     - cash_dividend     # When we get dividends from cash. Increases cash.
+    - interest          # Interest on the cash balance. Increases cash.
     - sell_fifo         # FIFO selling. 99% of time this is what you want.
     - sell_specific     # Specific unit/lot selling. Avoid if you don't know.
     - cash_opening      # Sets opening balance and the cash fund to use.
@@ -328,6 +343,7 @@ activity_types_which_have_tax_withholding:
     - sell_specific
     - stock_dividend
     - cash_dividend
+    - interest
 
 
 ###############################################################################
@@ -498,6 +514,19 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
             rate_percent: 0
             amount: 0
         misc_fees: 0.01  # See the "Note -1" at the end below.
+
+    - INTEREST_fidelity_1:  # Credit Interest on the cash balance.
+        activity_type: interest
+        broker: fidelity_rsu
+        date: 2024-08-31
+        amount: 0.15
+        # US-source interest to an NRA is usually withholding-exempt (0), but
+        # some periods carry an "NRA Tax Adj" -- net it into amount below and
+        # confirm against Form 1042-S.
+        tax_withholding:
+            rate_percent: 15
+            amount: 0.02
+        misc_fees: 0
 
     - STOCK_dividend_reinvest:
         activity_type: buy  # Reinvestment is a normal buy.
