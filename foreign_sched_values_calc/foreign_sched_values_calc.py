@@ -1215,15 +1215,35 @@ class ReceivedGiftTransaction(_BuyTransaction):
         figure the donor originally reported. The "Date of acquiring the
         interest" remains the receipt date.
 
-    Out of scope (the filer handles these manually):
+    Sec. 64(1)(iv) clubbing (opt-in via `clubbed`):
 
-      - Sec. 64(1)(iv) clubbing: dividends and capital gains on this lot are
-        clubbed in the donor's hands, but this tool still lists them in the
-        recipient's income reports (CG / FSI / dividend).
+      - When `clubbed` is True, the income arising on this lot (dividends and
+        capital gains) is taxable in the DONOR's hands, not the recipient's.
+        This lot's FY-for-tax income is then excluded from the recipient's
+        return (Schedule CG / Schedule OS / Schedule FSI / Form 67 and the
+        advance-tax accruals) and instead exported via
+        create_clubbed_income_for_donor() for the donor to report. The asset
+        itself is still owned by the recipient, so Schedule FA (peak / closing
+        / initial value, calendar-year dividends and sale proceeds) is
+        unaffected.
+
+      - The filer sets `clubbed` explicitly - the tool does not infer the
+        donor relationship. Set it True for a spouse gift covered by Sec.
+        64(1)(iv); leave it False for a gift from a parent / other relative
+        (cost basis and holding period still carry over, but the income stays
+        taxable to the recipient).
+
+      - Only stock dividends and capital gains are lot-attached and hence
+        clubbable here. Cash dividends and interest live on the cash wallet
+        with no lot linkage and are NOT auto-clubbed (irrelevant for foreign
+        RSU/ESPP holdings, whose dividends arrive as stock_dividend).
+
+    Out of scope (the filer handles these manually):
 
       - Sec. 56(2)(x): not applicable to a gift from a relative.
     """
     donor_acquisition_date: Date
+    clubbed: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -1231,6 +1251,14 @@ class ReceivedGiftTransaction(_BuyTransaction):
         if self.donor_acquisition_date > self.date:
             raise ValueError("donor_acquisition_date > receipt date for gift "
                              f"received transaction '{self.txn_id}'.")
+
+    @property
+    def is_income_clubbed(self) -> bool:
+        """
+        Whether income on this lot is clubbed in the donor's hands per Sec.
+        64(1)(iv). See the class docstring.
+        """
+        return self.clubbed
 
     @property
     def vest(self) -> bool:
@@ -2152,6 +2180,21 @@ class ShareLot(MapToEntity, DatewiseLog):
         return all_share_transactions[self.buy_txn_id]
 
     @property
+    def is_income_clubbed(self) -> bool:
+        """
+        True iff this lot was received as a spouse gift whose income is clubbed
+        in the donor's hands per Sec. 64(1)(iv). Such a lot's FY-for-tax income
+        (dividends / capital gains) is zeroed out of this filer's return - see
+        the guarded FY-for-tax properties below - while its calendar-year
+        Schedule FA figures are left intact. The excluded income is exported
+        for the donor via create_clubbed_income_for_donor().
+        """
+        return (
+            isinstance(self.buy_txn_obj, ReceivedGiftTransaction)
+            and self.buy_txn_obj.is_income_clubbed
+        )
+
+    @property
     def remaining_units(self) -> Fraction:
         return (
             self.buy_txn_obj.units
@@ -2413,14 +2456,32 @@ class ShareLot(MapToEntity, DatewiseLog):
             self.total_sale_proceeds_native_in_calendar_year
         )
 
+    # ---------------------------------------------------------------------
+    # FY-for-tax income properties.
+    #
+    # All of the properties/methods below report income of THIS lot that is
+    # taxable in the current filer's hands for the financial year. When the
+    # lot is a clubbed spouse gift (Sec. 64(1)(iv)), that income is taxable in
+    # the DONOR's hands instead, so every one of these short-circuits to zero
+    # (an empty (buy, sell, gain) tuple for the tuple variants) and the real
+    # figures are instead surfaced by create_clubbed_income_for_donor(), which
+    # reads the underlying trackers directly. The calendar-year Schedule FA
+    # properties above are deliberately NOT guarded - the recipient still owns
+    # and discloses the asset.
+    # ---------------------------------------------------------------------
+
     @property
     def total_dividends_inr_in_financial_year_for_tax(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.dividends.gross_total_value_inr_for_tax_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_gain_inr_in_financial_year_for_tax(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.gain_amount_inr_for_tax_between_dates(
             fy_start(), fy_end()
         )
@@ -2429,48 +2490,64 @@ class ShareLot(MapToEntity, DatewiseLog):
     def total_tax_withheld_on_dividends_inr_in_financial_year(
         self,
     ) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.dividends.total_tax_withheld_inr_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_tax_withheld_on_sell_inr_in_financial_year(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.total_tax_withheld_inr_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_ltcg_amount_inr_in_financial_year(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.total_ltcg_amount_inr_for_tax_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_stcg_amount_inr_in_financial_year(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.total_stcg_amount_inr_for_tax_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_ltcg_tax_inr_in_financial_year(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.total_ltcg_tax_inr_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_stcg_tax_inr_in_financial_year(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.total_stcg_tax_inr_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_ltcg_tax_withheld_inr_in_financial_year(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.total_ltcg_tax_withheld_inr_between_dates(
             fy_start(), fy_end()
         )
 
     @property
     def total_stcg_tax_withheld_inr_in_financial_year(self) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.total_stcg_tax_withheld_inr_between_dates(
             fy_start(), fy_end()
         )
@@ -2479,6 +2556,8 @@ class ShareLot(MapToEntity, DatewiseLog):
     def ltcg_amount_inr_for_which_tax_was_withheld_in_financial_year(
         self
     ) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.ltcg_amount_inr_for_which_tax_was_withheld_between_dates(  # noqa: E501
             fy_start(), fy_end()
         )
@@ -2487,6 +2566,8 @@ class ShareLot(MapToEntity, DatewiseLog):
     def stcg_amount_inr_for_which_tax_was_withheld_in_financial_year(
         self
     ) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.sellings.stcg_amount_inr_for_which_tax_was_withheld_between_dates(  # noqa: E501
             fy_start(), fy_end()
         )
@@ -2495,6 +2576,8 @@ class ShareLot(MapToEntity, DatewiseLog):
     def dividend_amount_inr_for_which_tax_was_withheld_in_financial_year(
         self
     ) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         return self.dividends.gross_total_amount_inr_for_which_tax_was_withheld_between_dates(  # noqa: E501
             fy_start(), fy_end()
         )
@@ -2503,6 +2586,8 @@ class ShareLot(MapToEntity, DatewiseLog):
     def total_buy_sell_ltcg_tuple_inr_in_financial_year(
         self,
     ) -> tuple[Fraction, Fraction, Fraction]:
+        if self.is_income_clubbed:
+            return (ZERO, ZERO, ZERO)
         return self.sellings.total_buy_sell_ltcg_tuple_inr_for_tax_between_dates(  # noqa: E501
             fy_start(), fy_end()
         )
@@ -2511,6 +2596,8 @@ class ShareLot(MapToEntity, DatewiseLog):
     def total_buy_sell_stcg_tuple_inr_in_financial_year(
         self,
     ) -> tuple[Fraction, Fraction, Fraction]:
+        if self.is_income_clubbed:
+            return (ZERO, ZERO, ZERO)
         return self.sellings.total_buy_sell_stcg_tuple_inr_for_tax_between_dates(  # noqa: E501
             fy_start(), fy_end()
         )
@@ -2519,6 +2606,8 @@ class ShareLot(MapToEntity, DatewiseLog):
         self,
         installment: int,
     ) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         func_name = f"date_in_fy_advance_tax_installment_{installment}"
         date_in_installment = globals()[func_name]
 
@@ -2532,6 +2621,8 @@ class ShareLot(MapToEntity, DatewiseLog):
         self,
         installment: int,
     ) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         func_name = f"date_in_fy_advance_tax_installment_{installment}"
         date_in_installment = globals()[func_name]
 
@@ -2545,6 +2636,8 @@ class ShareLot(MapToEntity, DatewiseLog):
         self,
         installment: int,
     ) -> Fraction:
+        if self.is_income_clubbed:
+            return ZERO
         func_name = f"date_in_fy_advance_tax_installment_{installment}"
         date_in_installment = globals()[func_name]
 
@@ -3085,11 +3178,13 @@ class Broker(MapToCountry, DatewiseLog):
         units: Fraction,
         donor_cost_per_unit: Fraction,
         donor_acquisition_date: Date,
+        clubbed: bool = False,
     ) -> None:
         """
         Create a new lot for shares received as a gift from a relative. No cash
         is involved (like a vest), and the cost basis and holding period carry
-        over from the donor - see ReceivedGiftTransaction.
+        over from the donor - see ReceivedGiftTransaction. When clubbed is True
+        the lot's income is taxed in the donor's hands per Sec. 64(1)(iv).
         """
         self._ensure_wallet_init()
 
@@ -3100,6 +3195,7 @@ class Broker(MapToCountry, DatewiseLog):
             units=units,
             cost_per_unit=donor_cost_per_unit,
             donor_acquisition_date=donor_acquisition_date,
+            clubbed=clubbed,
         )
 
         self.add_txn_to_log(gift_txn)
@@ -4429,10 +4525,24 @@ Gifting shares:
                                  2(42A), so LTCG/STCG is measured against this
                                  date, and the Schedule FA "initial value" uses
                                  this date's TTBR.
+      - clubbed                = OPTIONAL bool (default false). Set true for a
+                                 spouse gift whose income is clubbed in the
+                                 donor's hands per Sec. 64(1)(iv). Then this
+                                 lot's dividends and capital gains are EXCLUDED
+                                 from your (the recipient's) Schedule CG /
+                                 Schedule OS / Schedule FSI / Form 67, and are
+                                 instead exported to clubbed_income_for_donor.txt
+                                 for the donor to report. The asset is still
+                                 yours, so Schedule FA is unaffected. Leave false
+                                 for a gift from a parent / other relative (cost
+                                 basis and holding period still carry over, but
+                                 the income stays taxable to you). Only stock
+                                 dividends and capital gains are clubbed; cash
+                                 dividends / interest are not (irrelevant for
+                                 foreign RSU/ESPP holdings).
 
-    Only relative / exempt gifts are modelled. Sec. 64(1)(iv) clubbing (income
-    on the gifted shares is taxed in the donor's hands) and Sec. 56(2)(x)
-    (taxable non-relative gifts) are out of scope - handle them manually.
+    Only relative / exempt gifts are modelled. Sec. 56(2)(x) (taxable
+    non-relative gifts) is out of scope - handle it manually.
 """
 
 
@@ -4488,6 +4598,7 @@ def parse_opening_ledger() -> None:
                     units=activity_dict["remaining_units"],
                     donor_cost_per_unit=acq_dict["donor_cost_per_unit"],
                     donor_acquisition_date=acq_dict["donor_acquisition_date"],
+                    clubbed=acq_dict.get("clubbed", False),
                 )
 
             case _:
@@ -4627,6 +4738,7 @@ def _parse_main_activities(
                     donor_acquisition_date=(
                         activity_dict["donor_acquisition_date"]
                     ),
+                    clubbed=activity_dict.get("clubbed", False),
                 )
 
             case "cash_fund_switch":
@@ -4812,6 +4924,7 @@ def create_prefilled_yaml_for_next_year() -> None:
                             "donor_acquisition_date":
                                 buy_txn.donor_acquisition_date,
                             "donor_cost_per_unit": buy_txn.cost_per_unit,
+                            "clubbed": buy_txn.clubbed,
                         },
                     }})
                     continue
@@ -5511,6 +5624,164 @@ def create_schedule_fsi_and_form_67(avg_tax_rate: Fraction) -> None:
     """))
 
 
+def create_clubbed_income_for_donor() -> None:
+    """
+    Export the income on clubbed spouse-gift lots (Sec. 64(1)(iv)) so the DONOR
+    can report it in their own return.
+
+    This income has already been excluded from THIS filer's (the recipient's)
+    Schedule CG / Schedule OS / Schedule FSI / Form 67 (the FY-for-tax lot
+    properties short-circuit to zero for a clubbed lot). Here we read the
+    underlying trackers directly - bypassing that zeroing - to surface the raw
+    figures, bucketed by source country, with the country's withholding / DTAA
+    metadata so the donor can fill their Schedule CG, Schedule OS, Schedule FSI
+    and Form 67.
+
+    Only stock dividends and capital gains are lot-attached and hence covered;
+    cash dividends and interest are not clubbed here (see ReceivedGiftTransaction).
+
+    Nothing is written if there are no clubbed lots.
+    """
+    fy_s, fy_e = fy_start(), fy_end()
+
+    def cg_block(sellings, tuple_attr, withheld_amount_attr,
+                 tax_withheld_attr) -> dict[str, Fraction]:
+        buy, sell, gain = getattr(sellings, tuple_attr)(fy_s, fy_e)
+        with_wh = getattr(sellings, withheld_amount_attr)(fy_s, fy_e)
+        tax_withheld = getattr(sellings, tax_withheld_attr)(fy_s, fy_e)
+        return {
+            "buy": buy,
+            "sell": sell,
+            "gain": gain,
+            "gain_without_tax_withheld": gain - with_wh,
+            "gain_with_tax_withheld": with_wh,
+            "foreign_tax_withheld": tax_withheld,
+        }
+
+    def empty_country_bucket(country: Country) -> dict[str, Any]:
+        return {
+            "country_name": country.name,
+            "country_code": country.code,
+            "taxpayer_identification_number": country.tin_or_passport,
+            "ltcg": {"buy": ZERO, "sell": ZERO, "gain": ZERO,
+                     "gain_without_tax_withheld": ZERO,
+                     "gain_with_tax_withheld": ZERO,
+                     "foreign_tax_withheld": ZERO,
+                     "withholding_rate_percent":
+                         country.tax_withholding_rate_percent_for_ltcg,
+                     "dtaa_article": country.dtaa_article_ltcg,
+                     "dtaa_tax_rate_percent":
+                         country.dtaa_tax_rate_percent_ltcg},
+            "stcg": {"buy": ZERO, "sell": ZERO, "gain": ZERO,
+                     "gain_without_tax_withheld": ZERO,
+                     "gain_with_tax_withheld": ZERO,
+                     "foreign_tax_withheld": ZERO,
+                     "withholding_rate_percent":
+                         country.tax_withholding_rate_percent_for_stcg,
+                     "dtaa_article": country.dtaa_article_stcg,
+                     "dtaa_tax_rate_percent":
+                         country.dtaa_tax_rate_percent_stcg},
+            "dividend": {"gross": ZERO,
+                         "gross_without_tax_withheld": ZERO,
+                         "gross_with_tax_withheld": ZERO,
+                         "foreign_tax_withheld": ZERO,
+                         "withholding_rate_percent":
+                             country.tax_withholding_rate_percent_for_dividend,
+                         "dtaa_article": country.dtaa_article_dividend,
+                         "dtaa_tax_rate_percent":
+                             country.dtaa_tax_rate_percent_dividend},
+        }
+
+    per_country: dict[str, dict[str, Any]] = {}
+    found_any = False
+
+    for broker in brokers.values():
+        broker._ensure_wallet_init()
+        for lot_map in broker._lots.values():
+            for lot in lot_map.values():
+                if not lot.is_income_clubbed:
+                    continue
+                found_any = True
+
+                country = lot.country
+                bucket = per_country.setdefault(
+                    country.country_id, empty_country_bucket(country)
+                )
+
+                ltcg = cg_block(
+                    lot.sellings,
+                    "total_buy_sell_ltcg_tuple_inr_for_tax_between_dates",
+                    "ltcg_amount_inr_for_which_tax_was_withheld_between_dates",
+                    "total_ltcg_tax_withheld_inr_between_dates",
+                )
+                stcg = cg_block(
+                    lot.sellings,
+                    "total_buy_sell_stcg_tuple_inr_for_tax_between_dates",
+                    "stcg_amount_inr_for_which_tax_was_withheld_between_dates",
+                    "total_stcg_tax_withheld_inr_between_dates",
+                )
+
+                for key, block in (("ltcg", ltcg), ("stcg", stcg)):
+                    for f in ("buy", "sell", "gain",
+                              "gain_without_tax_withheld",
+                              "gain_with_tax_withheld", "foreign_tax_withheld"):
+                        bucket[key][f] += block[f]
+
+                div = lot.dividends
+                div_gross = div.gross_total_value_inr_for_tax_between_dates(
+                    fy_s, fy_e
+                )
+                div_with_wh = (
+                    div.gross_total_amount_inr_for_which_tax_was_withheld_between_dates(  # noqa: E501
+                        fy_s, fy_e
+                    )
+                )
+                div_tax = div.total_tax_withheld_inr_between_dates(fy_s, fy_e)
+
+                bucket["dividend"]["gross"] += div_gross
+                bucket["dividend"]["gross_without_tax_withheld"] += (
+                    div_gross - div_with_wh
+                )
+                bucket["dividend"]["gross_with_tax_withheld"] += div_with_wh
+                bucket["dividend"]["foreign_tax_withheld"] += div_tax
+
+    if not found_any:
+        return
+
+    def to_str(value: Any) -> Any:
+        if isinstance(value, Fraction):
+            return format(value, ".2f")
+        if isinstance(value, dict):
+            return {k: to_str(v) for k, v in value.items()}
+        return value
+
+    export = {
+        "note": (
+            "Income on spouse-gift lots clubbed under Sec. 64(1)(iv). This has "
+            "been EXCLUDED from this filer's return; the DONOR must report it "
+            "in theirs (Schedule CG / Schedule OS / Schedule FSI / Form 67). "
+            "All amounts are in INR. India tax / FTC are NOT computed here - "
+            "they depend on the donor's own average tax rate."
+        ),
+        "financial_year": f"{fy_s.isoformat()} to {fy_e.isoformat()}",
+        "per_country": {cid: to_str(data) for cid, data in per_country.items()},
+    }
+
+    txt_path = output_dir / "clubbed_income_for_donor.txt"
+    with open(txt_path, "w") as f:
+        json.dump(export, f, indent="\t")
+
+    rel_path = txt_path.relative_to(HERE)
+    print()
+    print(cleandoc(f"""
+        Clubbed spouse-gift income (Sec. 64(1)(iv)) exported to {rel_path}
+
+        These figures were excluded from THIS return. Hand them to the donor
+        spouse - they report this income in their own return. Do NOT report it
+        here.
+    """))
+
+
 ###############################################################################
 
 
@@ -5579,6 +5850,8 @@ def main() -> int:
 
     create_schedule_fa_table_a2()
     create_schedule_fa_table_a3()
+
+    create_clubbed_income_for_donor()
 
     avg_tax_rate = create_capital_gain_and_dividends_and_get_average_tax_rate()
     create_schedule_fsi_and_form_67(avg_tax_rate)

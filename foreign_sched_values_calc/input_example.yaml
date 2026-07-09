@@ -520,8 +520,7 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
     # Shares received as a gift from a relative (e.g. spouse). This creates a
     # new lot; no cash and no capital gain on receipt. The donor's cost basis
     # and holding period carry over (Sec. 49(1) and Sec. 2(42A)). NOTE: only
-    # relative/exempt gifts are modelled; Sec. 64(1)(iv) clubbing and Sec.
-    # 56(2)(x) are out of scope - handle them yourself.
+    # relative/exempt gifts are modelled; Sec. 56(2)(x) is out of scope.
     - STOCK_gift_received:
         activity_type: receive_gift
         broker: fidelity_rsu
@@ -530,6 +529,13 @@ activity_from_apr_1_current_fy_to_31_mar_current_fy:
         units: 3
         donor_cost_per_unit: 150.00    # Donor's ORIGINAL cost basis (native).
         donor_acquisition_date: 2021-02-15  # Donor's ORIGINAL purchase date.
+        # OPTIONAL (default false). Set true for a SPOUSE gift whose income is
+        # clubbed in the donor's hands (Sec. 64(1)(iv)): this lot's dividends
+        # and capital gains are then excluded from YOUR return and exported to
+        # clubbed_income_for_donor.txt for the donor. Schedule FA is unaffected
+        # (you still own the asset). Leave false / omit for a parent / other
+        # relative gift (income stays taxable to you).
+        clubbed: true
 
     - STOCK_dividend_1_fidelity:
         activity_type: stock_dividend
