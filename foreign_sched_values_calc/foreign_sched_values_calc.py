@@ -1078,6 +1078,16 @@ class _BuyTransaction(_ShareTransaction):
         raise NotImplementedError
 
     @property
+    def holding_period_start_date(self) -> Date:
+        """
+        Date from which the LTCG/STCG holding period runs. For a normal buy /
+        vest this is just the acquisition date. It is overridden for shares
+        received as a gift, where the previous owner's holding period is
+        included per Sec. 2(42A) Explanation 1(i)(b).
+        """
+        return self.date
+
+    @property
     def gross_total_value_native_non_tax(self) -> Fraction:
         raise NotImplementedError
 
@@ -1179,6 +1189,83 @@ class VestingTransaction(_BuyTransaction):
 
 
 @dataclass(kw_only=True)
+class ReceivedGiftTransaction(_BuyTransaction):
+    """
+    Shares received as a gift from a relative (e.g. a spouse). This is the
+    receiving counterpart of GiftTransaction (the gifting-out side).
+
+    Indian tax treatment modelled here (relative / exempt gift only):
+
+      - Cost basis carries over from the donor [Sec. 49(1)]: cost_per_unit is
+        the donor's original acquisition cost (native), and is used as-is for
+        capital gains when the lot is later sold.
+
+      - Holding period carries over [Sec. 2(42A) Explanation 1(i)(b)]: the
+        LTCG/STCG clock runs from the donor's ORIGINAL purchase date. This is
+        exposed via holding_period_start_date and consumed by
+        SellTransaction.is_long_term.
+
+      - Schedule FA: the lot is held (for opening units and peak / closing
+        values) only from the receipt date (self.date) since we did not hold
+        the asset before the gift. But the "Initial value of the investment"
+        is the donor's original cost converted at the donor's ORIGINAL
+        purchase-date TTBR (see the override of
+        total_buy_value_inr_for_initial_acquire_non_tax), i.e. the same INR
+        figure the donor originally reported. The "Date of acquiring the
+        interest" remains the receipt date.
+
+    Out of scope (the filer handles these manually):
+
+      - Sec. 64(1)(iv) clubbing: dividends and capital gains on this lot are
+        clubbed in the donor's hands, but this tool still lists them in the
+        recipient's income reports (CG / FSI / dividend).
+
+      - Sec. 56(2)(x): not applicable to a gift from a relative.
+    """
+    donor_acquisition_date: Date
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+
+        if self.donor_acquisition_date > self.date:
+            raise ValueError("donor_acquisition_date > receipt date for gift "
+                             f"received transaction '{self.txn_id}'.")
+
+    @property
+    def vest(self) -> bool:
+        return False
+
+    @property
+    def holding_period_start_date(self) -> Date:
+        return self.donor_acquisition_date
+
+    @property
+    def net_total_value_native(self) -> Fraction:
+        return self.gross_total_value_native
+
+    @property
+    def gross_total_value_native_non_tax(self) -> Fraction:
+        return self.gross_total_value_native
+
+    @property
+    def cost_per_unit_in_broker_doc(self) -> Fraction:
+        return self.cost_per_unit
+
+    @property
+    def total_buy_value_inr_for_initial_acquire_non_tax(self) -> Fraction:
+        """
+        Schedule FA "Initial value of the investment": the donor's original
+        cost converted at the donor's ORIGINAL purchase-date TTBR, not the
+        receipt-date TTBR. See the class docstring.
+        """
+        _, value = self.country.convert_to_inr_on(
+            self.donor_acquisition_date,
+            self.gross_total_value_native_non_tax,
+        )
+        return value
+
+
+@dataclass(kw_only=True)
 class SellTransaction(_ShareTransaction, _TaxWithholdingAndFees):
     buy_txn_id: str
     sale_proceeds_in_broker_doc: Fraction
@@ -1271,7 +1358,9 @@ class SellTransaction(_ShareTransaction, _TaxWithholdingAndFees):
         """
         return (
             self.entity.equity_type
-            and more_than_two_years(self.date, self.buy_txn_obj.date)
+            and more_than_two_years(
+                self.date, self.buy_txn_obj.holding_period_start_date
+            )
         )
 
     @property
@@ -2987,6 +3076,43 @@ class Broker(MapToCountry, DatewiseLog):
 
         self._lots[entity_id][txn_id] = lot
 
+    def add_lot_receive_gift(
+        self, *,
+        txn_id: str,
+        date: Date,
+        entity_id: str,
+        units: Fraction,
+        donor_cost_per_unit: Fraction,
+        donor_acquisition_date: Date,
+    ) -> None:
+        """
+        Create a new lot for shares received as a gift from a relative. No cash
+        is involved (like a vest), and the cost basis and holding period carry
+        over from the donor - see ReceivedGiftTransaction.
+        """
+        self._ensure_wallet_init()
+
+        gift_txn = ReceivedGiftTransaction(
+            date=date,
+            entity_id=entity_id,
+            txn_id=txn_id,
+            units=units,
+            cost_per_unit=donor_cost_per_unit,
+            donor_acquisition_date=donor_acquisition_date,
+        )
+
+        self.add_txn_to_log(gift_txn)
+
+        lot = ShareLot(entity_id=entity_id, buy_txn_id=txn_id)
+
+        if entity_id not in self._lots:
+            self._lots[entity_id] = {}
+        elif txn_id in self._lots[entity_id]:
+            raise ValueError(f"Lot with {txn_id} already exists for broker "
+                             f"{self.broker_id}.")
+
+        self._lots[entity_id][txn_id] = lot
+
     def _total_units_in_all_lots(self, entity_id: str) -> Fraction:
         total_units = ZERO
 
@@ -4226,6 +4352,7 @@ valid_activity_types:
     - sell_fifo         # FIFO selling. 99% of time this is what you want.
     - sell_specific     # Specific unit/lot selling. Avoid if you don't know.
     - gift_specific     # Specific unit/lot gifting. No sale/gain/cash.
+    - receive_gift      # Receive a gift from a relative. Creates a new lot.
     - cash_opening      # Sets opening balance and the cash fund to use.
     - cash_fund_switch  # To change cash fund used and transfer existing money.
     - bank_to_cash      # Add funds from bank account to broker account.
@@ -4236,6 +4363,7 @@ valid_activity_types_in_opening_ledger:
     - cash_opening
     - vest
     - buy
+    - receive_gift
 
 
 invalid_activity_types_in_normal_ledger:
@@ -4278,6 +4406,32 @@ ESPP (Employee Stock Purchase Plan) shares:
     VestingTransaction.total_value_inr_merchant_banker, which is currently
     unused in report generation, so it doesn't change any output (CG / Schedule
     FA / dividend / FSI / Form 67).
+
+
+Gifting shares:
+    "gift_specific" gifts units OUT of a specific lot (the donor side). There is
+    no sale, no capital gain (Sec. 47(iii)), and no cash movement; the lot's
+    remaining units simply drop. Fields: unit_lot_key (the buy txn ID of the lot
+    to gift from) and units.
+
+    "receive_gift" is the receiving side for shares gifted BY A RELATIVE (e.g. a
+    spouse). It creates a brand new lot (no cash, like a vest) with the donor's
+    values carried over. See ReceivedGiftTransaction for the full rationale. Use
+    it with:
+      - date                   = the date you received the gift
+      - units                  = units received
+      - donor_cost_per_unit    = the donor's ORIGINAL cost basis (native), which
+                                 carries over per Sec. 49(1) and is used for
+                                 capital gains when you later sell.
+      - donor_acquisition_date = the donor's ORIGINAL purchase date. The
+                                 holding period carries over from here per Sec.
+                                 2(42A), so LTCG/STCG is measured against this
+                                 date, and the Schedule FA "initial value" uses
+                                 this date's TTBR.
+
+    Only relative / exempt gifts are modelled. Sec. 64(1)(iv) clubbing (income
+    on the gifted shares is taxed in the donor's hands) and Sec. 56(2)(x)
+    (taxable non-relative gifts) are out of scope - handle them manually.
 """
 
 
@@ -4322,6 +4476,17 @@ def parse_opening_ledger() -> None:
                     units=activity_dict["remaining_units"],
                     cost_per_unit=acq_dict["stock_price_in_broker_doc"],
                     for_opening_lot=True,
+                )
+
+            case "receive_gift":
+                acq_dict = activity_dict["initial_acquisition"]
+                broker.add_lot_receive_gift(
+                    txn_id=activity_id,
+                    date=acq_dict["date"],
+                    entity_id=entity_id,
+                    units=activity_dict["remaining_units"],
+                    donor_cost_per_unit=acq_dict["donor_cost_per_unit"],
+                    donor_acquisition_date=acq_dict["donor_acquisition_date"],
                 )
 
             case _:
@@ -4449,6 +4614,18 @@ def _parse_main_activities(
                     date=date,
                     entity_id=entity.entity_id,
                     units=activity_dict["units"],
+                )
+
+            case "receive_gift":
+                broker.add_lot_receive_gift(
+                    txn_id=activity_id,
+                    date=date,
+                    entity_id=entity.entity_id,
+                    units=activity_dict["units"],
+                    donor_cost_per_unit=activity_dict["donor_cost_per_unit"],
+                    donor_acquisition_date=(
+                        activity_dict["donor_acquisition_date"]
+                    ),
                 )
 
             case "cash_fund_switch":
@@ -4618,6 +4795,25 @@ def create_prefilled_yaml_for_next_year() -> None:
                         f"{buy_txn_id} contains negative remaining units "
                         f"{remaining_units} on {start_date}."
                     )
+
+                if isinstance(buy_txn, ReceivedGiftTransaction):
+                    # A received gift carries over the donor's cost basis and
+                    # holding period, so we must preserve those instead of
+                    # collapsing it into a plain "buy" (which would restart the
+                    # holding period from the receipt date).
+                    opening_ledger.append({buy_txn_id: {
+                        "activity_type": "receive_gift",
+                        "broker": broker_id,
+                        "entity": buy_txn.entity_id,
+                        "remaining_units": remaining_units,
+                        "initial_acquisition": {
+                            "date": buy_txn.date,
+                            "donor_acquisition_date":
+                                buy_txn.donor_acquisition_date,
+                            "donor_cost_per_unit": buy_txn.cost_per_unit,
+                        },
+                    }})
+                    continue
 
                 entry_dict = {
                     "activity_type": "vest" if buy_txn.vest else "buy",
