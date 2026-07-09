@@ -23,6 +23,7 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 
 # Standard library dependencies.
+import argparse
 from collections import OrderedDict
 from collections.abc import Callable, Iterator, Hashable
 from copy import deepcopy
@@ -72,7 +73,7 @@ def init_global_vars() -> None:
     file_dir.mkdir(exist_ok=True)
 
     if not input_yaml_path.exists():
-        raise ValueError("input.yaml doesn't exist in the data/ directory.")
+        raise ValueError(f"Input file doesn't exist: {input_yaml_path}")
 
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     output_dir = file_dir / "output" / f"{timestamp}_{current_commit_id_str}"
@@ -5533,7 +5534,22 @@ def ensure_clean_working_tree() -> None:
 
 
 def main() -> int:
+    global input_yaml_path
+
     # ensure_clean_working_tree()
+
+    parser = argparse.ArgumentParser(
+        description="Calculate foreign asset schedule values for the ITR."
+    )
+    parser.add_argument(
+        "-i",
+        "--input",
+        type=Path,
+        default=input_yaml_path,
+        help="Path to the input YAML file (default: data/input.yaml).",
+    )
+    parsed_args = parser.parse_args()
+    input_yaml_path = parsed_args.input
 
     # Modifications to this is also an agreement to the license, which applies
     # to the source code.
