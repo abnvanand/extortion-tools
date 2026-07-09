@@ -2182,7 +2182,8 @@ class ShareLot(MapToEntity, DatewiseLog):
             holding_values["__opening"] = (units, units * opening_price)
 
         all_share_txns = [txn for txn in self.get_all_txns_on(date).values()
-                          if isinstance(txn, _ShareTransaction)]
+                          if isinstance(txn, (_ShareTransaction,
+                                              GiftTransaction))]
 
         if not all_share_txns:
             # No share transaction happened. We can use the high value.
@@ -4445,7 +4446,7 @@ def _parse_main_activities(
                 broker.gift_shares_specific(
                     txn_id=activity_id,
                     buy_txn_id=activity_dict["unit_lot_key"],
-                    date=activity_dict["date"],
+                    date=date,
                     entity_id=entity.entity_id,
                     units=activity_dict["units"],
                 )
