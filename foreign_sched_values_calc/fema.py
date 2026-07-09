@@ -53,8 +53,8 @@ The clock stops when idle cash is consumed by:
 Cash is fungible, so uses are matched FIFO (First-In-First-Out) against the
 oldest idle money -- the interpretation a taxpayer would actually claim.
 Merely moving cash to another fund/broker does NOT stop the clock, so
-cash_fund_switch (and vest / gift) are cash-neutral here, mirroring
-replay_cash_ledger.py.
+cash_fund_switch (and vest / gift / receive_gift) are cash-neutral here,
+mirroring replay_cash_ledger.py.
 
 Usage
 -----
@@ -120,8 +120,8 @@ CLOCK_STARTING_INCOME = {
 USE_DEBITS = {"buy", "cash_to_bank", "permitted_use_abroad"}
 
 # Activities with no cash effect (moving between funds/brokers does NOT stop the
-# clock; vests/gifts move no cash).
-NEUTRAL = {"vest", "gift", "gift_specific", "cash_fund_switch"}
+# clock; vests/gifts move no cash, whether shares are gifted out or received).
+NEUTRAL = {"vest", "gift", "gift_specific", "receive_gift", "cash_fund_switch"}
 
 
 class Tranche:
