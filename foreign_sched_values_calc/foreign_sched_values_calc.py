@@ -434,7 +434,16 @@ class Country(_BasePostInit):
         countries[self.country_id] = self
 
     def get_ttbr_on(self, date: Date) -> Fraction:
-        return ttbr_dict[self.currency][date]
+        rate = ttbr_dict[self.currency][date]
+
+        # SBI occasionally publishes a bogus 0 rate for a date (e.g. USD on
+        # 2022-04-30). Treat any non-positive rate as "not published" by
+        # raising KeyError, so callers fall back to an earlier date exactly
+        # as they already do for a missing date.
+        if rate <= 0:
+            raise KeyError(date)
+
+        return rate
 
     def _convert_to_inr_same_day(self, date: Date, amt: Fraction) -> Fraction:
         return amt * self.get_ttbr_on(date)
