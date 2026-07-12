@@ -3512,6 +3512,7 @@ class Broker(MapToCountry, DatewiseLog):
         misc_fees: Fraction,
         tax_withholding_dict: dict[str, Fraction],
         ex_date: Date = None,
+        record_date: Date = None,
     ) -> None:
         """
         The dividend is disbursed per-share, but the broker statement only gives
@@ -3521,16 +3522,48 @@ class Broker(MapToCountry, DatewiseLog):
         `date` is the *payment date* -- when the cash is credited, and hence the
         date used for the transaction, TTBR and CY/FY bucketing.
 
-        Eligibility, however, is fixed on the *ex-dividend date*: you earn the
-        dividend on shares you already held before the stock went ex-dividend,
-        even if you sell them before the payment date. If `ex_date` is given, we
-        therefore size each lot by the units it held at the start of `ex_date`
-        (`opening_units_on`), so lots sold between ex-date and payment date still
-        get their share and lots bought on/after ex-date get nothing. Without
-        `ex_date` we fall back to the units still held at payment time, which is
-        wrong whenever shares are acquired or sold in that window.
+        Eligibility is determined by one of two mutually exclusive parameters:
+
+        `ex_date` (ex-dividend date) -- correct for open-market purchases:
+            You earn the dividend on shares held *before* the stock went
+            ex-dividend. Under T+2 settlement, a buyer on the ex-date settles
+            two days later and misses the record date, so `ex_date` is set one
+            business day before the record date to exclude them. We size each
+            lot by its units at the *start* of `ex_date` (`opening_units_on`),
+            so lots sold between ex-date and payment date still get their share
+            and lots bought on/after ex-date get nothing.
+
+        `record_date` -- required for ESPP / vest lots:
+            ESPP shares and RSU vests are allocated directly by the plan
+            administrator and settle the *same day* (no T+2 lag). A lot
+            acquired on the ex-date is therefore already registered in the
+            books by the record date and is entitled to the dividend -- but the
+            `ex_date` cutoff incorrectly excludes it because its buy date falls
+            on the ex-date. Use `record_date` instead: a lot qualifies if its
+            buy date is on or before the record date, and we count units held at
+            the *close* of the record date (`opening_units_on(record_date + 1)`),
+            so lots sold on/after the record date still receive their share.
+
+            Example (NVDA Q3 2021 dividend):
+                ex/eff date  = 2021-08-31
+                record date  = 2021-09-01
+                payment date = 2021-09-23
+            An ESPP lot purchased on 2021-08-31 settles immediately and appears
+            in the books on 2021-09-01 (the record date), so it is entitled to
+            the dividend. Using ex_date=2021-08-31 would wrongly exclude it;
+            using record_date=2021-09-01 correctly includes it.
+
+        `ex_date` and `record_date` are mutually exclusive. Without either we
+        fall back to units still held at payment time, which is wrong whenever
+        shares are acquired or sold between the eligibility cutoff and payment.
         """
         self._ensure_wallet_init()
+
+        if ex_date is not None and record_date is not None:
+            raise ValueError(
+                f"Dividend {txn_id}: ex_date and record_date are mutually "
+                "exclusive; specify only one."
+            )
 
         if ex_date is not None and ex_date > date:
             raise ValueError(
@@ -3538,11 +3571,26 @@ class Broker(MapToCountry, DatewiseLog):
                 f"date {date}. The ex-dividend date must precede payment."
             )
 
+        if record_date is not None and record_date > date:
+            raise ValueError(
+                f"Dividend {txn_id}: record_date {record_date} is after the "
+                f"payment date {date}. The record date must precede payment."
+            )
+
         def eligible_units(lot: "ShareLot") -> Fraction:
             """Units of `lot` that earned this dividend."""
+            if record_date is not None:
+                # ESPP / vest lots settle same-day, so a lot acquired on the
+                # ex-date is already registered by the record date. Eligible if
+                # buy date is on or before the record date.
+                if lot.buy_txn_obj.date > record_date:
+                    return ZERO
+                # Units at close of record date = start of the following day.
+                day_after = record_date + timedelta(days=1)
+                return lot.opening_units_on(day_after)
             if ex_date is None:
                 return lot.remaining_units
-            # Bought on/after ex-date -> not entitled to this dividend.
+            # Open-market lots: bought on/after ex-date -> not entitled.
             if lot.buy_txn_obj.date >= ex_date:
                 return ZERO
             return lot.opening_units_on(ex_date)
@@ -4444,6 +4492,8 @@ valid_activity_types:
     - vest              # It's free, no cash is involved, you just get stocks.
     - buy               # Cash is used up for buying.
     - stock_dividend    # When we get dividends from stocks. Increases cash.
+                        # Use ex_date for open-market lots, record_date for
+                        # ESPP/vest lots (see "Dividend eligibility" below).
     - cash_dividend     # When we get dividends from cash. Increases cash.
     - interest          # Interest on the cash balance. Increases cash.
     - sell_fifo         # FIFO selling. 99% of time this is what you want.
@@ -4473,6 +4523,41 @@ activity_types_which_have_tax_withholding:
     - stock_dividend
     - cash_dividend
     - interest
+
+
+Dividend eligibility: ex_date vs record_date for stock_dividend:
+    The broker statement gives you one aggregate dividend amount for your whole
+    holding, which the tool splits back among individual lots. To do this
+    correctly it needs to know which lots were eligible.
+
+    Two parameters control this, mutually exclusive:
+
+    ex_date:
+        The ex-dividend date. Use this when ALL your lots were acquired via
+        open-market purchases (regular "buy" activities). Under US T+2
+        settlement, a buyer on the ex-date settles two days later and therefore
+        misses the record date -- so the ex-date is the correct cutoff: lots
+        bought BEFORE ex_date are eligible; lots bought ON or AFTER are not.
+
+    record_date:
+        The date the company checks its shareholder register. Use this when
+        ANY eligible lot was acquired via ESPP or vest, which settle the SAME
+        DAY (no T+2 lag). Such a lot bought ON the ex-date is already in the
+        books by the record date and IS entitled to the dividend -- but using
+        ex_date would wrongly exclude it. With record_date, a lot is eligible
+        if its acquisition date is on or before the record date.
+
+        Example (NVDA Q3 2021 dividend):
+            ex/eff date  = 2021-08-31   <-- do NOT use as ex_date
+            record date  = 2021-09-01   <-- use as record_date
+            payment date = 2021-09-23
+        An ESPP lot purchased on 2021-08-31 settles the same day and is
+        registered in the books by 2021-09-01. Using ex_date=2021-08-31
+        wrongly excludes it; record_date=2021-09-01 correctly includes it.
+
+    Rule of thumb:
+        - Pure open-market holding          → use ex_date
+        - Any ESPP or vest lot in the mix   → use record_date
 
 
 ESPP (Employee Stock Purchase Plan) shares:
@@ -4665,6 +4750,7 @@ def _parse_main_activities(
                     misc_fees=activity_dict["misc_fees"],
                     tax_withholding_dict=activity_dict["tax_withholding"],
                     ex_date=activity_dict.get("ex_date"),
+                    record_date=activity_dict.get("record_date"),
                 )
 
             case "cash_dividend":
