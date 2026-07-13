@@ -168,7 +168,8 @@ def debit_amount(atype, d):
     if atype == "buy":
         return d["units"] * d["stock_price_in_broker_doc"]
     if atype in ("cash_to_bank", "permitted_use_abroad"):
-        return d["amount"]
+        _, fees = _tax_and_fees(d)
+        return d["amount"] + fees
     raise ValueError(f"Not a debit activity type: {atype}")
 
 
