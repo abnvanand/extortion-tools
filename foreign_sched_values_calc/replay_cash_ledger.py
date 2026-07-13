@@ -10,7 +10,7 @@ gets prefilled as next year's `cash_opening` amount.
 
 Cash rules mirrored from the main script:
   cash_opening                         : opening balance
-  stock_dividend / cash_dividend       : credit  amount - tax_withheld - misc_fees
+  stock_dividend / cash_dividend / interest : credit  amount - tax_withheld - misc_fees
   sell_fifo / sell_specific            : credit  units*price - tax_withheld - misc_fees
   buy                                  : debit   units*price   (fees NOT drawn from cash)
   cash_to_bank                         : debit   amount + misc_fees
@@ -62,7 +62,7 @@ def cash_delta(atype: str, d: dict):
     match atype:
         case "cash_opening":
             return d["amount"], "opening balance"
-        case "stock_dividend" | "cash_dividend":
+        case "stock_dividend" | "cash_dividend" | "interest":
             return (d["amount"] - tax - fees,
                     f"gross {float(d['amount']):.2f} - tax {float(tax):.2f}"
                     f" - fees {float(fees):.2f}")
