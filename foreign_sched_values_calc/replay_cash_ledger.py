@@ -13,7 +13,7 @@ Cash rules mirrored from the main script:
   stock_dividend / cash_dividend       : credit  amount - tax_withheld - misc_fees
   sell_fifo / sell_specific            : credit  units*price - tax_withheld - misc_fees
   buy                                  : debit   units*price   (fees NOT drawn from cash)
-  cash_to_bank                         : debit   amount        (misc_fees ignored, per main script)
+  cash_to_bank                         : debit   amount + misc_fees
   bank_to_cash                         : credit  amount - misc_fees
   vest / gift_specific / receive_gift / cash_fund_switch : no cash effect
 
@@ -78,7 +78,8 @@ def cash_delta(atype: str, d: dict):
             gross = d["units"] * price
             return -gross, f"{float(d['units']):g} x {float(price):.2f}"
         case "cash_to_bank":
-            return -d["amount"], "wire out"
+            return (-(d["amount"] + fees),
+                    f"wire out {float(d['amount']):.2f} + fees {float(fees):.2f}")
         case "bank_to_cash":
             return d["amount"] - fees, f"wire in - fees {float(fees):.2f}"
         case "vest" | "gift_specific" | "receive_gift" | "cash_fund_switch":

@@ -4849,10 +4849,11 @@ def _parse_main_activities(
                 )
 
             case "cash_to_bank":
+                misc_fees = activity_dict.get("misc_fees", ZERO) or ZERO
                 broker.withdraw_cash(
                     txn_id=activity_id,
                     date=date,
-                    amount=activity_dict["amount"],
+                    amount=activity_dict["amount"] + misc_fees,
                     ghar_vaapsi=True,
                 )
 
