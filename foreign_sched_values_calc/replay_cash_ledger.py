@@ -92,7 +92,7 @@ def main() -> None:
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--input", default=str(default_input))
-    ap.add_argument("--broker", default="schwab_stock_plan")
+    ap.add_argument("--broker", required=True)
     ap.add_argument("--cutoff", default=None,
                     help="YYYY-MM-DD; default = Dec 31 of the CY containing "
                          "the FY start (i.e. next year's opening date - 1).")
