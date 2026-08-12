@@ -257,47 +257,73 @@ def _consume_fifo(queue, need):
 
 
 def analyze(doc, as_of, window_days, include_lrs):
-    """Run the FIFO cash ledger per broker up to `as_of`; return outstanding
-    clock-bearing tranches with their remaining balances, plus data smells."""
+    """Run the FIFO cash ledger per broker up to `as_of`.
+
+    Returns (findings, overdrawn, trace):
+      findings   -- outstanding clock-bearing tranches with remaining balances
+      overdrawn  -- data-smell warnings
+      trace      -- chronological list of credit/consume/transfer events, used
+                    by --trace and --flag-late-use; empty list when not needed
+                    (callers pass collect_trace=True to populate it)
+    """
+    return _analyze(doc, as_of, window_days, include_lrs, collect_trace=False)
+
+
+def _analyze(doc, as_of, window_days, include_lrs, collect_trace):
     events = collect_events(doc)
 
     ledgers = {}             # broker_id -> FIFO list of open Tranches
     overdrawn = []           # uses that drew more cash than available
-    # transfer_id -> list of Tranche portions in-flight between brokers
-    pending_transfers = {}
+    pending_transfers = {}   # transfer_id -> Tranche portions in-flight
+    trace = []               # chronological event log (populated if collect_trace)
+
+    def _trace(event):
+        if collect_trace:
+            trace.append(event)
 
     for broker, date, aid, atype, d, _ in events:
         if date is None or date > as_of:
-            continue  # ignore undated or future activity
+            continue
         queue = ledgers.setdefault(broker, [])
 
         if atype in CLOCK_STARTING_INCOME:
             amt = credit_amount(atype, d)
             if amt > 0:
-                queue.append(Tranche(date, CLOCK_STARTING_INCOME[atype], amt,
-                                     aid))
+                nature = CLOCK_STARTING_INCOME[atype]
+                queue.append(Tranche(date, nature, amt, aid))
+                _trace({"type": "credit", "broker": broker, "date": date,
+                        "activity_id": aid, "activity_type": atype,
+                        "nature": nature, "amount": amt})
         elif atype == "cash_opening":
             amt = credit_amount(atype, d)
             if amt > 0:
                 queue.append(Tranche(date, "opening balance", amt, aid,
                                      clock_bearing=True, origin_known=False))
+                _trace({"type": "credit", "broker": broker, "date": date,
+                        "activity_id": aid, "activity_type": atype,
+                        "nature": "opening balance", "amount": amt})
         elif atype == "bank_to_cash":
             transfer_id = d.get("transfer_id")
             if transfer_id:
-                # Inbound leg of an inter-broker transfer: restore the carried
-                # tranches (original dates/natures) into the destination queue.
                 carried = pending_transfers.pop(transfer_id, None)
                 if carried is None:
                     overdrawn.append((broker, date, aid, atype
-                                      + f"[transfer_id={transfer_id}:no matching cash_to_bank]",
-                                      None))
+                                      + f"[transfer_id={transfer_id}:"
+                                        f"no matching cash_to_bank]", None))
                 else:
                     queue.extend(carried)
+                    _trace({"type": "transfer_in", "broker": broker,
+                            "date": date, "activity_id": aid,
+                            "transfer_id": transfer_id,
+                            "portions": _portions(carried)})
             else:
                 amt = credit_amount(atype, d)
                 if amt > 0:
                     queue.append(Tranche(date, "LRS inflow", amt, aid,
                                          clock_bearing=include_lrs))
+                    _trace({"type": "credit", "broker": broker, "date": date,
+                            "activity_id": aid, "activity_type": atype,
+                            "nature": "LRS inflow", "amount": amt})
         elif atype == "cash_to_bank":
             transfer_id = d.get("transfer_id")
             need = debit_amount(atype, d)
@@ -305,24 +331,30 @@ def analyze(doc, as_of, window_days, include_lrs):
             if shortfall > 0:
                 overdrawn.append((broker, date, aid, atype, shortfall))
             if transfer_id:
-                # Inter-broker transfer: carry the deducted tranche portions to
-                # the destination instead of retiring them.
                 pending_transfers[transfer_id] = taken
-            # else: repatriation to India -- tranches are simply consumed (taken
-            # is discarded), which is already handled by _consume_fifo above.
+                _trace({"type": "transfer_out", "broker": broker, "date": date,
+                        "activity_id": aid, "transfer_id": transfer_id,
+                        "portions": _portions(taken),
+                        "shortfall": shortfall})
+            else:
+                _trace({"type": "consume", "broker": broker, "date": date,
+                        "activity_id": aid, "activity_type": atype,
+                        "portions": _portions_with_days(taken, date),
+                        "shortfall": shortfall})
         elif atype in USE_DEBITS:
             need = debit_amount(atype, d)
-            shortfall, _ = _consume_fifo(queue, need)
+            shortfall, taken = _consume_fifo(queue, need)
             if shortfall > 0:
                 overdrawn.append((broker, date, aid, atype, shortfall))
+            _trace({"type": "consume", "broker": broker, "date": date,
+                    "activity_id": aid, "activity_type": atype,
+                    "portions": _portions_with_days(taken, date),
+                    "shortfall": shortfall})
         elif atype in NEUTRAL:
             pass
         else:
-            # Unknown activity: surface it rather than silently miscount cash.
             overdrawn.append((broker, date, aid, f"UNKNOWN:{atype}", None))
 
-    # Orphaned transfers: cash_to_bank with transfer_id never matched by a
-    # bank_to_cash -- report as a data warning.
     for transfer_id, tranches in pending_transfers.items():
         total = sum(t.remaining for t in tranches)
         overdrawn.append((None, None, f"transfer_id={transfer_id}",
@@ -347,7 +379,24 @@ def analyze(doc, as_of, window_days, include_lrs):
             })
         if rows:
             findings[broker] = rows
-    return findings, overdrawn
+    return findings, overdrawn, trace
+
+
+def _portions(taken):
+    """Trace helper: snapshot of carried/consumed tranche portions."""
+    return [{"source_activity_id": t.activity_id, "source_date": t.date,
+             "source_nature": t.nature, "amount": t.remaining,
+             "clock_bearing": t.clock_bearing}
+            for t in taken]
+
+
+def _portions_with_days(taken, consume_date):
+    """Like _portions but also records how long the cash was held."""
+    return [{"source_activity_id": t.activity_id, "source_date": t.date,
+             "source_nature": t.nature, "amount": t.remaining,
+             "clock_bearing": t.clock_bearing,
+             "days_held": (consume_date - t.date).days}
+            for t in taken]
 
 
 def status_of(row, warn_days):
@@ -456,6 +505,104 @@ def print_report(findings, overdrawn, currencies, as_of, window_days,
     return worst
 
 
+def print_trace(trace, currencies):
+    """Print a chronological log of every credit, consume, and transfer event."""
+    print()
+    print("=" * 90)
+    print("  FEMA ACTIVITY TRACE")
+    print("=" * 90)
+    if not trace:
+        print("\n  (no events)\n")
+        return
+
+    LABELS = {
+        "credit":       "CREDIT      ",
+        "consume":      "CONSUME     ",
+        "transfer_out": "TRANSFER-OUT",
+        "transfer_in":  "TRANSFER-IN ",
+    }
+
+    for ev in trace:
+        etype = ev["type"]
+        broker = ev["broker"]
+        date = ev["date"]
+        aid = ev["activity_id"]
+        ccy = currencies.get(broker, "")
+        label = LABELS.get(etype, etype.upper())
+
+        if etype == "credit":
+            print(f"\n  {label}  {broker:<25} {date}  {ev['nature']:<14} "
+                  f"{float(ev['amount']):>12,.2f} {ccy}  [{aid}]")
+
+        elif etype == "consume":
+            atype = ev.get("activity_type", "")
+            shortfall = ev.get("shortfall", ZERO)
+            print(f"\n  {label}  {broker:<25} {date}  by [{aid}] ({atype})")
+            for p in ev["portions"]:
+                days = p["days_held"]
+                flag = " *** FEMA OVERDUE at consumption" if p["clock_bearing"] and days > FEMA_WINDOW_DAYS else ""
+                print(f"              {'':25}         "
+                      f"  {p['source_nature']:<14} {float(p['amount']):>12,.2f} {ccy}"
+                      f"  [{p['source_activity_id']}]  rcvd {p['source_date']}  held {days}d{flag}")
+            if shortfall > 0:
+                print(f"              {'':25}         "
+                      f"  {'SHORTFALL':<14} {float(shortfall):>12,.2f} {ccy}")
+
+        elif etype == "transfer_out":
+            dst = ev.get("transfer_id", "")
+            shortfall = ev.get("shortfall", ZERO)
+            print(f"\n  {label}  {broker:<25} {date}  [{aid}]  (transfer_id: {dst})")
+            for p in ev["portions"]:
+                print(f"              {'':25}         "
+                      f"  {p['source_nature']:<14} {float(p['amount']):>12,.2f} {ccy}"
+                      f"  [{p['source_activity_id']}]  rcvd {p['source_date']}")
+            if shortfall > 0:
+                print(f"              {'':25}         "
+                      f"  {'SHORTFALL':<14} {float(shortfall):>12,.2f} {ccy}")
+
+        elif etype == "transfer_in":
+            src = ev.get("transfer_id", "")
+            print(f"\n  {label}  {broker:<25} {date}  [{aid}]  (transfer_id: {src})")
+            for p in ev["portions"]:
+                print(f"              {'':25}         "
+                      f"  {p['source_nature']:<14} {float(p['amount']):>12,.2f} {ccy}"
+                      f"  [{p['source_activity_id']}]  rcvd {p['source_date']}")
+    print()
+
+
+def print_late_use(trace, currencies, window_days):
+    """Print tranches that were consumed after the FEMA window had already elapsed."""
+    late = []
+    for ev in trace:
+        if ev["type"] != "consume":
+            continue
+        for p in ev["portions"]:
+            if p["clock_bearing"] and p["days_held"] > window_days:
+                late.append({**ev, "_portion": p})
+
+    print()
+    print("=" * 90)
+    print(f"  LATE-USE REPORT  (clock-bearing tranches consumed after {window_days}-day window)")
+    print("=" * 90)
+
+    if not late:
+        print(f"\n  No clock-bearing tranche was consumed after the {window_days}-day window. Clean.\n")
+        return
+
+    for item in late:
+        broker = item["broker"]
+        ccy = currencies.get(broker, "")
+        p = item["_portion"]
+        overdue_by = p["days_held"] - window_days
+        print(f"\n  Broker : {broker}   ({ccy})")
+        print(f"  Consumed by : [{item['activity_id']}] ({item.get('activity_type', '')}) on {item['date']}")
+        print(f"  Source      : [{p['source_activity_id']}]  {p['source_nature']}  "
+              f"rcvd {p['source_date']}  held {p['days_held']}d  "
+              f"(overdue by {overdue_by}d)")
+        print(f"  Amount      : {float(p['amount']):,.2f} {ccy}")
+    print()
+
+
 def to_json(findings, overdrawn, currencies, as_of, window_days, warn_days,
             include_lrs):
     out = {
@@ -520,6 +667,14 @@ def main():
                     help="Also list items comfortably within the window (OK).")
     ap.add_argument("--json", action="store_true",
                     help="Emit machine-readable JSON instead of a report.")
+    ap.add_argument("--trace", action="store_true",
+                    help="After the main report, print a chronological log of "
+                         "every credit, consume, and inter-broker transfer event "
+                         "showing which tranches were consumed by which activity.")
+    ap.add_argument("--flag-late-use", action="store_true",
+                    help="After the main report, list clock-bearing tranches that "
+                         "were consumed (reinvested / repatriated) only after the "
+                         "FEMA window had already elapsed.")
     args = ap.parse_args()
 
     as_of = Date.fromisoformat(args.as_of) if args.as_of else Date.today()
@@ -529,12 +684,17 @@ def main():
 
     currencies = build_broker_currency_map(doc)
     include_lrs = not args.exclude_lrs
+    need_trace = args.trace or args.flag_late_use
 
-    findings, overdrawn = analyze(doc, as_of, args.window_days, include_lrs)
+    findings, overdrawn, trace = _analyze(doc, as_of, args.window_days,
+                                          include_lrs,
+                                          collect_trace=need_trace)
 
     if args.broker:
         findings = {k: v for k, v in findings.items() if k == args.broker}
         overdrawn = [o for o in overdrawn if o[0] == args.broker]
+        if need_trace:
+            trace = [e for e in trace if e.get("broker") == args.broker]
 
     if args.json:
         print(json.dumps(
@@ -549,6 +709,11 @@ def main():
         worst = print_report(findings, overdrawn, currencies, as_of,
                              args.window_days, args.warn_days, include_lrs,
                              args.all)
+
+    if args.trace:
+        print_trace(trace, currencies)
+    if args.flag_late_use:
+        print_late_use(trace, currencies, args.window_days)
 
     # 0 clean, 1 advisory/warn, 2 breach.
     sys.exit(2 if worst >= 3 else (1 if worst >= 1 else 0))
