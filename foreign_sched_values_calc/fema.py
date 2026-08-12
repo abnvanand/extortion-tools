@@ -46,7 +46,7 @@ The clock starts the day realized foreign currency lands as idle cash:
 
 The clock stops when idle cash is consumed by:
   * buy                    -> reinvestment
-  * cash_to_bank           -> repatriation to India
+  * cash_to_bank           -> repatriation to India (no transfer_id)
   * permitted_use_abroad   -> optional activity you may add for travel/education/
                               medical spends abroad (not in the base schema)
 
@@ -55,6 +55,24 @@ oldest idle money -- the interpretation a taxpayer would actually claim.
 Merely moving cash to another fund/broker does NOT stop the clock, so
 cash_fund_switch (and vest / gift / receive_gift) are cash-neutral here,
 mirroring replay_cash_ledger.py.
+
+Inter-broker transfers (e.g. Schwab -> IBKR)
+---------------------------------------------
+Moving sale proceeds between two *foreign* brokers is NOT repatriation, so
+the 180-day clock must not reset.  Record the transfer as a matched pair:
+
+  cash_to_bank entry (source broker):
+    transfer_id: schwab_to_ibkr_2026_01
+
+  bank_to_cash entry (destination broker):
+    transfer_id: schwab_to_ibkr_2026_01
+
+When transfer_id is present the tool carries the exact tranche portions
+(original receipt date, nature, remaining balance) from the source to the
+destination queue.  The destination clock therefore continues from the
+original receipt date, not from the transfer date.  Any bank_to_cash with a
+transfer_id is silently ignored as the "inbound leg" -- the tranche was
+already accounted for on the source side.
 
 Usage
 -----
@@ -117,7 +135,8 @@ CLOCK_STARTING_INCOME = {
 }
 
 # Activities that consume idle cash and thereby stop the clock.
-USE_DEBITS = {"buy", "cash_to_bank", "permitted_use_abroad"}
+# cash_to_bank is handled explicitly below (transfer_id changes its semantics).
+USE_DEBITS = {"buy", "permitted_use_abroad"}
 
 # Activities with no cash effect (moving between funds/brokers does NOT stop the
 # clock; vests/gifts move no cash, whether shares are gifted out or received).
@@ -218,13 +237,34 @@ def collect_events(doc):
     return events
 
 
+def _consume_fifo(queue, need):
+    """Debit `need` from the FIFO queue; return (shortfall, taken_tranches).
+
+    taken_tranches is a list of new Tranche objects representing the portions
+    actually consumed, preserving the original receipt dates and natures.
+    """
+    taken = []
+    for tr in queue:
+        if need <= 0:
+            break
+        take = min(tr.remaining, need)
+        tr.remaining -= take
+        need -= take
+        if take > 0:
+            taken.append(Tranche(tr.date, tr.nature, take, tr.activity_id,
+                                 tr.clock_bearing, tr.origin_known))
+    return need, taken
+
+
 def analyze(doc, as_of, window_days, include_lrs):
     """Run the FIFO cash ledger per broker up to `as_of`; return outstanding
     clock-bearing tranches with their remaining balances, plus data smells."""
     events = collect_events(doc)
 
-    ledgers = {}          # broker_id -> FIFO list of open Tranches
-    overdrawn = []        # uses that drew more cash than available
+    ledgers = {}             # broker_id -> FIFO list of open Tranches
+    overdrawn = []           # uses that drew more cash than available
+    # transfer_id -> list of Tranche portions in-flight between brokers
+    pending_transfers = {}
 
     for broker, date, aid, atype, d, _ in events:
         if date is None or date > as_of:
@@ -242,25 +282,51 @@ def analyze(doc, as_of, window_days, include_lrs):
                 queue.append(Tranche(date, "opening balance", amt, aid,
                                      clock_bearing=True, origin_known=False))
         elif atype == "bank_to_cash":
-            amt = credit_amount(atype, d)
-            if amt > 0:
-                queue.append(Tranche(date, "LRS inflow", amt, aid,
-                                     clock_bearing=include_lrs))
+            transfer_id = d.get("transfer_id")
+            if transfer_id:
+                # Inbound leg of an inter-broker transfer: restore the carried
+                # tranches (original dates/natures) into the destination queue.
+                carried = pending_transfers.pop(transfer_id, None)
+                if carried is None:
+                    overdrawn.append((broker, date, aid, atype
+                                      + f"[transfer_id={transfer_id}:no matching cash_to_bank]",
+                                      None))
+                else:
+                    queue.extend(carried)
+            else:
+                amt = credit_amount(atype, d)
+                if amt > 0:
+                    queue.append(Tranche(date, "LRS inflow", amt, aid,
+                                         clock_bearing=include_lrs))
+        elif atype == "cash_to_bank":
+            transfer_id = d.get("transfer_id")
+            need = debit_amount(atype, d)
+            shortfall, taken = _consume_fifo(queue, need)
+            if shortfall > 0:
+                overdrawn.append((broker, date, aid, atype, shortfall))
+            if transfer_id:
+                # Inter-broker transfer: carry the deducted tranche portions to
+                # the destination instead of retiring them.
+                pending_transfers[transfer_id] = taken
+            # else: repatriation to India -- tranches are simply consumed (taken
+            # is discarded), which is already handled by _consume_fifo above.
         elif atype in USE_DEBITS:
             need = debit_amount(atype, d)
-            for tr in queue:
-                if need <= 0:
-                    break
-                take = min(tr.remaining, need)
-                tr.remaining -= take
-                need -= take
-            if need > 0:
-                overdrawn.append((broker, date, aid, atype, need))
+            shortfall, _ = _consume_fifo(queue, need)
+            if shortfall > 0:
+                overdrawn.append((broker, date, aid, atype, shortfall))
         elif atype in NEUTRAL:
             pass
         else:
             # Unknown activity: surface it rather than silently miscount cash.
             overdrawn.append((broker, date, aid, f"UNKNOWN:{atype}", None))
+
+    # Orphaned transfers: cash_to_bank with transfer_id never matched by a
+    # bank_to_cash -- report as a data warning.
+    for transfer_id, tranches in pending_transfers.items():
+        total = sum(t.remaining for t in tranches)
+        overdrawn.append((None, None, f"transfer_id={transfer_id}",
+                          "UNMATCHED_TRANSFER", total))
 
     findings = {}
     for broker, queue in ledgers.items():
@@ -383,7 +449,8 @@ def print_report(findings, overdrawn, currencies, as_of, window_days,
               "an unknown\n     activity type was seen (check your YAML):")
         for broker, date, aid, atype, need in overdrawn:
             extra = f" -- short by {float(need):,.2f}" if need is not None else ""
-            print(f"    - {broker} {date} {aid} [{atype}]{extra}")
+            loc = f"{broker} {date}" if broker else "(global)"
+            print(f"    - {loc} {aid} [{atype}]{extra}")
 
     print()
     return worst
@@ -421,8 +488,8 @@ def to_json(findings, overdrawn, currencies, as_of, window_days, warn_days,
         }
     for broker, date, aid, atype, need in overdrawn:
         out["data_warnings"].append({
-            "broker": broker, "date": str(date), "activity_id": aid,
-            "activity_type": atype,
+            "broker": broker, "date": str(date) if date else None,
+            "activity_id": aid, "activity_type": atype,
             "shortfall_native": round(float(need), 2) if need is not None
             else None,
         })
